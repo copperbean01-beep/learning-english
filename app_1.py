@@ -7,7 +7,6 @@ from datetime import date, timedelta
 
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 
 try:
     from reportlab.lib import colors
@@ -1202,65 +1201,9 @@ def vocab_page():
 
 
 
-
-def render_browser_speak_button(word, key, label="🔊", height=34):
-    """ブラウザ標準の Web Speech API で英単語を読み上げるボタン。MP3は生成しません。"""
-    word_text = str(word or "").strip()
-    if not word_text:
-        return
-
-    # JavaScript文字列として安全に渡す
-    word_js = json.dumps(word_text, ensure_ascii=False)
-    label_html = html.escape(label)
-    components.html(
-        f"""
-        <button id="speak-{key}" class="speak-btn" type="button" aria-label="Speak {html.escape(word_text)}">{label_html}</button>
-        <script>
-        const btn = document.getElementById("speak-{key}");
-        btn.addEventListener("click", function() {{
-            const text = {word_js};
-            if (!("speechSynthesis" in window)) {{
-                alert("このブラウザは音声読み上げに対応していません。");
-                return;
-            }}
-            window.speechSynthesis.cancel();
-            const u = new SpeechSynthesisUtterance(text);
-            u.lang = "en-US";
-            u.rate = 0.82;
-            u.pitch = 1.0;
-            u.volume = 1.0;
-
-            const voices = window.speechSynthesis.getVoices();
-            const enVoice = voices.find(v => v.lang === "en-US") || voices.find(v => v.lang && v.lang.startsWith("en"));
-            if (enVoice) u.voice = enVoice;
-            window.speechSynthesis.speak(u);
-        }});
-        </script>
-        <style>
-        html, body {{ margin: 0; padding: 0; background: transparent; overflow: hidden; }}
-        .speak-btn {{
-            width: 100%;
-            height: {max(28, int(height) - 4)}px;
-            min-height: 28px;
-            border-radius: 8px;
-            border: 1px solid rgba(255,255,255,.45);
-            background: transparent;
-            color: #eef4ff;
-            font-size: 16px;
-            font-weight: 800;
-            cursor: pointer;
-            line-height: 1;
-        }}
-        .speak-btn:hover {{ background: rgba(255,255,255,.08); color: #ffffff; }}
-        .speak-btn:active {{ transform: scale(.96); }}
-        </style>
-        """,
-        height=height,
-    )
-
 def passitan_page():
     st.subheader("📗 英検準1級 でる順パス単")
-    st.caption("スマホではカード表示、PCでは表表示を選べます。🔊ボタンでブラウザ音声読み上げができます。意味は英単語にマウスを置くと表示されます。")
+    st.caption("スマホではカード表示、PCでは表表示を選べます。意味は英単語にマウスを置くと表示されます。")
 
     passitan_df = load_passitan_words()
 
@@ -1370,11 +1313,6 @@ def passitan_page():
             font-weight: 850;
             line-height: 1.2;
             overflow-wrap: anywhere;
-        }
-        .passitan-card-speak {
-            margin-left: auto;
-            width: 48px;
-            flex: 0 0 48px;
         }
         .passitan-card-meaning {
             color: #b7ffcf;
@@ -1510,9 +1448,7 @@ def passitan_page():
                 """,
                 unsafe_allow_html=True,
             )
-            a0, a1, a2 = st.columns([0.8, 1, 1])
-            with a0:
-                render_browser_speak_button(word, key=f"card_{row_id}", label="🔊", height=36)
+            a1, a2 = st.columns([1, 1])
             with a1:
                 checked = st.checkbox(
                     "Known",
@@ -1534,10 +1470,9 @@ def passitan_page():
                     )
                     st.success(msg) if ok else st.error(msg)
     else:
-        h_no, h_word, h_speak, h_example, h_known, h_add = st.columns([0.38, 1.45, 0.56, 5.5, 0.78, 0.86], gap=None)
+        h_no, h_word, h_example, h_known, h_add = st.columns([0.38, 1.55, 5.8, 0.78, 0.86], gap=None)
         h_no.markdown('<div class="passitan-table-header passitan-cell-center passitan-table-row">No.</div>', unsafe_allow_html=True)
         h_word.markdown('<div class="passitan-table-header passitan-table-row">英単語</div>', unsafe_allow_html=True)
-        h_speak.markdown('<div class="passitan-table-header passitan-cell-center passitan-table-row">音声</div>', unsafe_allow_html=True)
         h_example.markdown('<div class="passitan-table-header passitan-table-row">例文</div>', unsafe_allow_html=True)
         h_known.markdown('<div class="passitan-table-header passitan-cell-center passitan-table-row">Known</div>', unsafe_allow_html=True)
         h_add.markdown('<div class="passitan-table-header passitan-cell-center passitan-table-row">単語帳</div>', unsafe_allow_html=True)
@@ -1554,14 +1489,11 @@ def passitan_page():
             safe_meaning = html.escape(meaning)
             safe_example = html.escape(example)
 
-            c_no, c_word, c_speak, c_example, c_known, c_add = st.columns([0.38, 1.45, 0.56, 5.5, 0.78, 0.86], gap=None)
+            c_no, c_word, c_example, c_known, c_add = st.columns([0.38, 1.55, 5.8, 0.78, 0.86], gap=None)
             with c_no:
                 st.markdown(f'<div class="passitan-cell passitan-cell-center passitan-table-row"><b>{no}</b></div>', unsafe_allow_html=True)
             with c_word:
                 st.markdown(f'<div class="passitan-cell passitan-table-row"><span class="passitan-word" title="{safe_meaning}">{safe_word}</span></div>', unsafe_allow_html=True)
-            with c_speak:
-                st.markdown('<div class="passitan-table-row"></div>', unsafe_allow_html=True)
-                render_browser_speak_button(word, key=f"table_{row_id}", label="🔊", height=34)
             with c_example:
                 st.markdown(f'<div class="passitan-cell passitan-table-row"><div class="passitan-example">{safe_example}</div></div>', unsafe_allow_html=True)
             with c_known:
