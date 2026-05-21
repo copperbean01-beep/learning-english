@@ -888,7 +888,11 @@ def render_card(row, show_answer=True):
                 synonyms=row.get("synonyms", ""),
                 note="試験問題から登録",
             )
-            st.success(msg) if ok else st.error(msg)
+            # st.success(msg) if ok else st.error(msg)
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
 
         with st.expander("わからない選択肢を単語帳に登録"):
             for idx, ch in enumerate(choices, start=1):
@@ -907,7 +911,10 @@ def render_card(row, show_answer=True):
                         synonyms="",
                         note="試験問題の選択肢から登録",
                     )
-                    st.success(msg) if ok else st.error(msg)
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
     st.markdown('</div>', unsafe_allow_html=True)
 
 
@@ -1021,7 +1028,10 @@ def quiz_page(df):
                 synonyms=row.get("synonyms", ""),
                 note="Quizから登録",
             )
-            st.success(msg) if ok else st.error(msg)
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
 
         with st.expander("わからない選択肢を単語帳に登録"):
             for idx, ch in enumerate(row["choices"], start=1):
@@ -1040,7 +1050,10 @@ def quiz_page(df):
                         synonyms="",
                         note="Quizの選択肢から登録",
                     )
-                    st.success(msg) if ok else st.error(msg)
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
 
         c1, c2 = st.columns(2)
         with c1:
@@ -1131,7 +1144,10 @@ def vocab_page():
                         with col:
                             if st.button(label, key=f"review_{result}_{row['id']}"):
                                 ok, msg = review_vocab_word(row["id"], result)
-                                st.success(msg) if ok else st.error(msg)
+                                if ok:
+                                    st.success(msg)
+                                else:
+                                    st.error(msg)
                                 st.rerun()
                     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -1240,7 +1256,10 @@ def vocab_page():
                     synonyms=synonyms,
                     note=note,
                 )
-                st.success(msg) if ok else st.error(msg)
+                if ok:
+                    st.success(msg)
+                else:
+                    st.error(msg)
                 st.rerun()
 
 
@@ -1312,9 +1331,12 @@ def passitan_page():
         uploaded = st.file_uploader("パス単CSVをアップロード", type=["csv"])
         if uploaded is not None:
             ok, msg = import_passitan_csv_to_db(uploaded)
-            st.success(msg) if ok else st.error(msg)
             if ok:
-                st.rerun()
+                st.success(msg)
+            else:
+                st.error(msg)
+            # if ok:
+            #    st.rerun()
         return
 
     passitan_all_df = passitan_all_df.copy()
@@ -1600,7 +1622,12 @@ def passitan_page():
                         example_sentence=example,
                         note="パス単リストから登録",
                     )
-                    st.success(msg) if ok else st.error(msg)
+                    # st.success(msg) if ok else st.error(msg)
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
+
     else:
         h_no, h_word, h_speak, h_example, h_known, h_add = st.columns([0.38, 1.45, 0.56, 5.5, 0.78, 0.86], gap=None)
         h_no.markdown('<div class="passitan-table-header passitan-cell-center passitan-table-row">No.</div>', unsafe_allow_html=True)
@@ -1652,7 +1679,10 @@ def passitan_page():
                         example_sentence=example,
                         note="パス単リストから登録",
                     )
-                    st.success(msg) if ok else st.error(msg)
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
 
     next_start = int(start_no) + int(display_n)
     max_no = int(passitan_df["display_no"].max())
