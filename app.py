@@ -1203,7 +1203,7 @@ def vocab_page():
 
 def passitan_page():
     st.subheader("📗 英検準1級 でる順パス単")
-    st.caption("単語を表形式で表示します。意味は英単語にマウスを置くと表示されます。わかったチェックと自分用単語帳への登録もできます。")
+    st.caption("スマホではカード表示、PCでは表表示を選べます。意味は英単語にマウスを置くと表示されます。")
 
     passitan_df = load_passitan_words()
 
@@ -1225,7 +1225,7 @@ def passitan_page():
     c3.metric("未チェック", total - known_count)
 
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    col_a, col_b, col_c, col_d = st.columns([1, 1, 2, 1])
+    col_a, col_b, col_c, col_d, col_e = st.columns([1, 1, 2, 1, 1.2])
     with col_a:
         display_n = st.selectbox("表示件数", [10, 20, 50], index=2)
     with col_b:
@@ -1247,6 +1247,14 @@ def passitan_page():
         keyword = st.text_input("検索", placeholder="例: affect / 影響")
     with col_d:
         hide_known = st.checkbox("わかった単語を隠す", value=False)
+    with col_e:
+        view_mode = st.radio(
+            "表示形式",
+            ["スマホカード", "PC表"],
+            index=0,
+            horizontal=False,
+            help="携帯電話では『スマホカード』を使うと表崩れを防げます。",
+        )
     st.markdown('</div>', unsafe_allow_html=True)
 
     view = passitan_df.copy()
@@ -1273,696 +1281,242 @@ def passitan_page():
     st.markdown(
         """
         <style>
-        /* パス単テーブル：1つの表のように見せるため、Streamlitの余白を徹底的に削除 */
-        div[data-testid="stHorizontalBlock"] { gap: 0 !important; }
-
-        /* ヘッダー行・データ行の横ブロック */
-        div[data-testid="stHorizontalBlock"]:has(.passitan-table-header),
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) {
-            gap: 0 !important;
-            margin: 0 !important;
-            padding: 0 !important;
-            min-height: 30px !important;
-            align-items: stretch !important;
+        .passitan-card {
+            padding: 12px 14px;
+            border-radius: 16px;
+            background: rgba(255,255,255,.045);
+            border: 1px solid rgba(255,255,255,.18);
+            margin: 0 0 10px 0;
         }
-
-        div[data-testid="stHorizontalBlock"]:has(.passitan-table-header) > div[data-testid="column"],
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"] {
-            padding: 0 !important;
-            margin: 0 !important;
-        }
-
-        /* Streamlitが各要素の上下に入れる余白を削除 */
-        div[data-testid="element-container"]:has(.passitan-table-header),
-        div[data-testid="element-container"]:has(.passitan-cell),
-        div[data-testid="element-container"]:has(.passitan-row-marker) {
-            margin: 0 !important;
-            padding: 0 !important;
-        }
-
-        .passitan-row-marker {
-            display: none !important;
-            height: 0 !important;
-            line-height: 0 !important;
-        }
-
-        /* ヘッダーセル */
-        .passitan-table-header {
-            box-sizing: border-box;
-            height: 30px;
-            min-height: 30px;
-            max-height: 30px;
-            line-height: 30px;
-            padding: 0 6px;
-            margin: 0;
+        .passitan-card-top {
             display: flex;
             align-items: center;
-            overflow: hidden;
-            background: rgba(255,255,255,.16);
-            border-top: 1px solid rgba(255,255,255,.40);
-            border-bottom: 1px solid rgba(255,255,255,.32);
-            border-left: 1px solid rgba(255,255,255,.32);
-            border-right: 0;
-            border-radius: 0;
+            gap: 8px;
+            margin-bottom: 6px;
+        }
+        .passitan-card-no {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 38px;
+            height: 24px;
+            border-radius: 999px;
+            background: rgba(255,255,255,.12);
+            color: #dce8fb;
+            font-size: 12px;
             font-weight: 850;
-            color: #eef4ff;
+            flex: 0 0 auto;
         }
-        div[data-testid="stHorizontalBlock"]:has(.passitan-table-header) > div[data-testid="column"]:last-child .passitan-table-header {
-            border-right: 1px solid rgba(255,255,255,.32);
+        .passitan-card-word {
+            color: #ffffff;
+            font-size: 20px;
+            font-weight: 850;
+            line-height: 1.2;
+            overflow-wrap: anywhere;
         }
-
-        /* Markdownセル：No / 英単語 / 例文 */
+        .passitan-card-meaning {
+            color: #b7ffcf;
+            font-size: 13px;
+            line-height: 1.35;
+            margin: 0 0 6px 0;
+        }
+        .passitan-card-example {
+            color: #d7e2f5;
+            font-size: 15px;
+            line-height: 1.45;
+            margin: 0;
+            overflow-wrap: anywhere;
+        }
+        .passitan-table-header,
         .passitan-cell {
             box-sizing: border-box;
-            height: 30px;
-            min-height: 30px;
-            max-height: 30px;
-            line-height: 30px;
-            padding: 0 6px;
+            min-height: 34px;
+            padding: 4px 6px;
             margin: 0;
             display: flex;
             align-items: center;
             overflow: hidden;
-            background: rgba(255,255,255,.035);
             border-left: 1px solid rgba(255,255,255,.24);
-            border-right: 0;
             border-bottom: 1px solid rgba(255,255,255,.20);
             border-radius: 0;
         }
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:last-child {
-            border-right: 1px solid rgba(255,255,255,.24) !important;
+        .passitan-table-header {
+            background: rgba(255,255,255,.16);
+            border-top: 1px solid rgba(255,255,255,.40);
+            font-weight: 850;
+            color: #eef4ff;
         }
-        .passitan-cell p { margin: 0 !important; padding: 0 !important; }
-        div[data-testid="element-container"]:has(.passitan-cell) .stMarkdown { margin: 0 !important; padding: 0 !important; }
-        .passitan-cell-center {
-            justify-content: center;
-            text-align: center;
-            padding: 0 2px;
-        }
-
+        .passitan-cell { background: rgba(255,255,255,.035); }
+        .passitan-cell-center { justify-content: center; text-align: center; }
         .passitan-word {
             display: inline-block;
-            font-size: 17px;
+            font-size: 16px;
             font-weight: 850;
-            color: white;
-            padding: 0;
-            border-radius: 0;
-            background: transparent;
-            border: 0;
-            cursor: help;
-            line-height: 30px;
+            color: #fff;
             max-width: 100%;
             white-space: nowrap;
             overflow: hidden;
             text-overflow: ellipsis;
-        }
-        .passitan-word:hover {
-            color: #9fd8ff;
-            text-decoration: underline;
+            cursor: help;
         }
         .passitan-example {
+            width: 100%;
             color: #d7e2f5;
-            line-height: 30px;
-            font-size: 17px;
+            font-size: 15px;
             white-space: nowrap;
             overflow: hidden;
             text-overflow: ellipsis;
-            width: 100%;
         }
-
-        /* No.列も他のセルと同じ高さ・中央揃えにする */
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(1) {
-            box-sizing: border-box;
-            height: 30px !important;
-            min-height: 30px !important;
-            max-height: 30px !important;
-            padding: 0 !important;
-            margin: 0 !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-            overflow: hidden !important;
-        }
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(1) div[data-testid="element-container"] {
-            margin: 0 !important;
-            padding: 0 !important;
-            height: 30px !important;
-            min-height: 30px !important;
-            max-height: 30px !important;
-            width: 100% !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-        }
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(1) .stMarkdown,
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(1) div[data-testid="stMarkdownContainer"] {
-            margin: 0 !important;
-            padding: 0 !important;
-            height: 30px !important;
-            min-height: 30px !important;
-            max-height: 30px !important;
-            width: 100% !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-        }
-        .passitan-no-cell {
-            width: 100% !important;
-            justify-content: center !important;
-            text-align: center !important;
-            font-size: 15px !important;
-            font-weight: 850 !important;
-        }
-
-        /* Known / 単語帳の列そのものを表セル化 */
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(4),
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(5) {
-            box-sizing: border-box;
-            height: 30px !important;
-            min-height: 30px !important;
-            max-height: 30px !important;
-            padding: 0 !important;
-            margin: 0 !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-            overflow: hidden !important;
-            background: rgba(255,255,255,.035);
-            border-left: 1px solid rgba(255,255,255,.24);
-            border-bottom: 1px solid rgba(255,255,255,.20);
-            border-right: 0;
-        }
-
-        /* Known / 登録列の内部コンテナ余白を削除 */
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(4) div[data-testid="element-container"],
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(5) div[data-testid="element-container"] {
-            margin: 0 !important;
-            padding: 0 !important;
-            height: 30px !important;
-            min-height: 30px !important;
-            max-height: 30px !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-        }
-
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) div[data-testid="stCheckbox"] {
-            margin: 0 !important;
-            padding: 0 !important;
-            height: 30px !important;
-            min-height: 30px !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-        }
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) div[data-testid="stCheckbox"] label {
-            margin: 0 !important;
-            padding: 0 !important;
-            height: 30px !important;
-            min-height: 30px !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-        }
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) div[data-testid="stCheckbox"] input {
+        div[data-testid="stHorizontalBlock"]:has(.passitan-table-row) { gap: 0 !important; }
+        div[data-testid="stHorizontalBlock"]:has(.passitan-table-row) > div[data-testid="column"] { padding: 0 !important; }
+        div[data-testid="stHorizontalBlock"]:has(.passitan-table-row) div[data-testid="element-container"] { margin: 0 !important; padding: 0 !important; }
+        div[data-testid="stHorizontalBlock"]:has(.passitan-table-row) div[data-testid="stCheckbox"] { display:flex !important; justify-content:center !important; align-items:center !important; min-height:34px !important; }
+        div[data-testid="stHorizontalBlock"]:has(.passitan-table-row) div[data-testid="stCheckbox"] label { justify-content:center !important; width:100% !important; }
+        div[data-testid="stHorizontalBlock"]:has(.passitan-table-row) div[data-testid="stCheckbox"] p { display:none !important; }
+        div[data-testid="stHorizontalBlock"]:has(.passitan-table-row) div[data-testid="stCheckbox"] input,
+        div[data-testid="stHorizontalBlock"]:has(.passitan-table-row) div[data-testid="stCheckbox"] svg,
+        div[data-testid="stHorizontalBlock"]:has(.passitan-table-row) div[data-testid="stCheckbox"] [role="checkbox"] {
             transform: scale(1.35) !important;
-            margin: 0 !important;
-        }
-
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) div[data-testid="stButton"] {
-            margin: 0 !important;
-            padding: 0 !important;
-            width: 100% !important;
-            height: 30px !important;
-            min-height: 30px !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-        }
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) div[data-testid="stButton"] > button {
-            min-height: 24px !important;
-            height: 24px !important;
-            width: calc(100% - 8px) !important;
-            padding: 0 4px !important;
-            margin: 0 4px !important;
-            border-radius: 5px !important;
-            font-size: 12px !important;
-            line-height: 1 !important;
-        }
-
-
-        /* Known列・単語帳列：ウィジェットをセルのど真ん中に固定 */
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(4),
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(5) {
-            position: relative !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-            text-align: center !important;
-        }
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(4) > div,
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(5) > div,
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(4) div[data-testid="stVerticalBlock"],
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(5) div[data-testid="stVerticalBlock"] {
-            width: 100% !important;
-            height: 30px !important;
-            min-height: 30px !important;
-            margin: 0 !important;
-            padding: 0 !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-        }
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(4) div[data-testid="stCheckbox"] {
-            width: 100% !important;
-            height: 30px !important;
-            min-height: 30px !important;
-            margin: 0 !important;
-            padding: 0 !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-            transform: translateY(0px) !important;
-        }
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(4) div[data-testid="stCheckbox"] label {
-            width: 100% !important;
-            height: 30px !important;
-            min-height: 30px !important;
-            margin: 0 !important;
-            padding: 0 !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-            gap: 0 !important;
-        }
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(4) div[data-testid="stCheckbox"] label > div {
-            margin: 0 auto !important;
-            padding: 0 !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-        }
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(4) div[data-testid="stCheckbox"] p {
-            display: none !important;
-        }
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(5) div[data-testid="stButton"] {
-            width: 100% !important;
-            height: 30px !important;
-            min-height: 30px !important;
-            margin: 0 !important;
-            padding: 0 !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-        }
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(5) div[data-testid="stButton"] > button {
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-            margin: 0 auto !important;
-            padding: 0 6px !important;
-            width: 56px !important;
-            min-width: 56px !important;
-            max-width: 56px !important;
-            height: 24px !important;
-            min-height: 24px !important;
-            line-height: 24px !important;
-            position: static !important;
-        }
-
-
-
-        /* === 追加修正: Known列・単語帳列も、英単語/例文セルと同じ背景色にする === */
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(4),
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(5) {
-            background: rgba(255,255,255,.035) !important;
-            border-left: 1px solid rgba(255,255,255,.24) !important;
-            border-bottom: 1px solid rgba(255,255,255,.20) !important;
-            box-sizing: border-box !important;
-        }
-
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(4) *,
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(5) * {
-            box-sizing: border-box !important;
-        }
-
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(4) > div,
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(5) > div,
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(4) div[data-testid="stVerticalBlock"],
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(5) div[data-testid="stVerticalBlock"],
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(4) div[data-testid="element-container"],
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(5) div[data-testid="element-container"] {
-            background: transparent !important;
-            margin: 0 !important;
-            padding: 0 !important;
-            height: 30px !important;
-            min-height: 30px !important;
-            max-height: 30px !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-        }
-
-        /* チェックボックスはセル背景を邪魔しないよう透明化し、中央に固定 */
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(4) div[data-testid="stCheckbox"],
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(4) div[data-testid="stCheckbox"] label,
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(4) div[data-testid="stCheckbox"] label > div {
-            background: transparent !important;
-            margin: 0 !important;
-            padding: 0 !important;
-            width: 100% !important;
-            height: 30px !important;
-            min-height: 30px !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-        }
-
-        /* 登録ボタン列もセル背景は列側で統一。ボタン自体は小さく中央配置 */
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(5) div[data-testid="stButton"] {
-            background: transparent !important;
-            width: 100% !important;
-            height: 30px !important;
-            min-height: 30px !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-            margin: 0 !important;
-            padding: 0 !important;
-        }
-
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(5) div[data-testid="stButton"] > button {
-            margin: 0 auto !important;
-            width: 56px !important;
-            min-width: 56px !important;
-            max-width: 56px !important;
-            height: 24px !important;
-            min-height: 24px !important;
-            padding: 0 6px !important;
-            border-radius: 5px !important;
-            font-size: 12px !important;
-            line-height: 1 !important;
-        }
-
-        .passitan-next-wrap {
-            position: fixed;
-            right: 28px;
-            bottom: 28px;
-            z-index: 9999;
-            background: rgba(8,17,31,.78);
-            border: 1px solid rgba(255,255,255,.16);
-            border-radius: 18px;
-            padding: 8px;
-            box-shadow: 0 16px 40px rgba(0,0,0,.35);
-        }
-
-
-        /* === 追加修正: checkboxを大きく、Known/登録エリアは色なしにする === */
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(4),
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(5) {
-            background: transparent !important;
-        }
-
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(4) > div,
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(5) > div,
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(4) div[data-testid="stVerticalBlock"],
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(5) div[data-testid="stVerticalBlock"],
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(4) div[data-testid="element-container"],
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(5) div[data-testid="element-container"] {
-            background: transparent !important;
-        }
-
-        /* Known checkbox: 大きく、余計な色や背景を消す */
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(4) div[data-testid="stCheckbox"],
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(4) div[data-testid="stCheckbox"] label,
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(4) div[data-testid="stCheckbox"] label > div {
-            background: transparent !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-            width: 100% !important;
-            height: 30px !important;
-            min-height: 30px !important;
-            margin: 0 !important;
-            padding: 0 !important;
-        }
-
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(4) div[data-testid="stCheckbox"] input {
-            transform: scale(1.85) !important;
-            accent-color: #ffffff !important;
-            margin: 0 !important;
-        }
-
-        /* Streamlitのcheckbox描画部分を大きくする */
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(4) div[data-testid="stCheckbox"] svg,
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(4) div[data-testid="stCheckbox"] [role="checkbox"] {
-            transform: scale(1.45) !important;
             transform-origin: center center !important;
         }
-
-        /* 登録ボタン: 色なし。白/グレーの枠だけにする */
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(5) div[data-testid="stButton"] > button {
+        div[data-testid="stHorizontalBlock"]:has(.passitan-table-row) div[data-testid="stButton"] { display:flex !important; justify-content:center !important; align-items:center !important; min-height:34px !important; }
+        div[data-testid="stHorizontalBlock"]:has(.passitan-table-row) div[data-testid="stButton"] > button {
+            width: 58px !important;
+            min-width: 58px !important;
+            height: 26px !important;
+            min-height: 26px !important;
+            padding: 0 6px !important;
+            border-radius: 6px !important;
+            font-size: 12px !important;
             background: transparent !important;
             background-image: none !important;
             color: #eef4ff !important;
             border: 1px solid rgba(255,255,255,.45) !important;
             box-shadow: none !important;
         }
-
-        div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) > div[data-testid="column"]:nth-child(5) div[data-testid="stButton"] > button:hover {
-            background: rgba(255,255,255,.08) !important;
-            background-image: none !important;
-            color: #ffffff !important;
-            border: 1px solid rgba(255,255,255,.65) !important;
+        .passitan-next-wrap {
+            position: fixed;
+            right: 24px;
+            bottom: 24px;
+            z-index: 9999;
+            background: rgba(8,17,31,.78);
+            border: 1px solid rgba(255,255,255,.16);
+            border-radius: 16px;
+            padding: 8px;
+            box-shadow: 0 16px 40px rgba(0,0,0,.35);
         }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-
-    # 携帯電話では、Streamlitのst.columns表が崩れやすいため、自動でカード表示に切り替える
-    st.markdown(
-        """
-        <style>
-        @media (min-width: 769px) {
-            div[data-testid="stHorizontalBlock"]:has(.passitan-mobile-card-marker) {
-                display: none !important;
-            }
-        }
-
         @media (max-width: 768px) {
-            div[data-testid="stHorizontalBlock"]:has(.passitan-table-header),
-            div[data-testid="stHorizontalBlock"]:has(.passitan-row-marker) {
-                display: none !important;
-            }
-            div[data-testid="stHorizontalBlock"]:has(.passitan-mobile-card-marker) {
-                display: flex !important;
-                gap: 0 !important;
-                align-items: stretch !important;
-                margin: 0 0 8px 0 !important;
-                padding: 0 !important;
-                border: 1px solid rgba(255,255,255,.20);
-                border-radius: 14px;
-                background: rgba(255,255,255,.045);
-                overflow: hidden;
-            }
-            div[data-testid="stHorizontalBlock"]:has(.passitan-mobile-card-marker) > div[data-testid="column"] {
-                padding: 8px 10px !important;
-                margin: 0 !important;
-            }
-            div[data-testid="stHorizontalBlock"]:has(.passitan-mobile-card-marker) > div[data-testid="column"]:first-child {
-                border-right: 1px solid rgba(255,255,255,.16);
-            }
-            .passitan-mobile-card-marker { display: none !important; }
-            .passitan-mobile-top {
-                display: flex;
-                align-items: center;
-                gap: 8px;
-                margin: 0 0 4px 0;
-                line-height: 1.2;
-            }
-            .passitan-mobile-no {
-                display: inline-flex;
-                align-items: center;
-                justify-content: center;
-                min-width: 34px;
-                height: 24px;
-                border-radius: 999px;
-                background: rgba(255,255,255,.12);
-                color: #dce8fb;
-                font-size: 12px;
-                font-weight: 800;
-            }
-            .passitan-mobile-word {
-                color: #ffffff;
-                font-size: 18px;
-                font-weight: 850;
-                line-height: 1.2;
-                cursor: help;
-            }
-            .passitan-mobile-example {
-                color: #d7e2f5;
-                font-size: 15px;
-                line-height: 1.35;
-                margin: 0;
-            }
-            div[data-testid="stHorizontalBlock"]:has(.passitan-mobile-card-marker) div[data-testid="stCheckbox"] {
-                display: flex !important;
-                justify-content: center !important;
-                margin: 0 !important;
-                padding: 0 !important;
-            }
-            div[data-testid="stHorizontalBlock"]:has(.passitan-mobile-card-marker) div[data-testid="stCheckbox"] label {
-                display: flex !important;
-                justify-content: center !important;
-                gap: 4px !important;
-                font-size: 12px !important;
-            }
-            div[data-testid="stHorizontalBlock"]:has(.passitan-mobile-card-marker) div[data-testid="stCheckbox"] input,
-            div[data-testid="stHorizontalBlock"]:has(.passitan-mobile-card-marker) div[data-testid="stCheckbox"] svg,
-            div[data-testid="stHorizontalBlock"]:has(.passitan-mobile-card-marker) div[data-testid="stCheckbox"] [role="checkbox"] {
-                transform: scale(1.28) !important;
-                transform-origin: center center !important;
-            }
-            div[data-testid="stHorizontalBlock"]:has(.passitan-mobile-card-marker) div[data-testid="stButton"] {
-                display: flex !important;
-                justify-content: center !important;
-                margin-top: 6px !important;
-            }
-            div[data-testid="stHorizontalBlock"]:has(.passitan-mobile-card-marker) div[data-testid="stButton"] > button {
-                width: 64px !important;
-                min-height: 28px !important;
-                height: 28px !important;
-                padding: 0 8px !important;
-                font-size: 12px !important;
-                border-radius: 7px !important;
-                background: transparent !important;
-                background-image: none !important;
-                color: #eef4ff !important;
-                border: 1px solid rgba(255,255,255,.45) !important;
-                box-shadow: none !important;
-            }
-            .passitan-next-wrap {
-                right: 12px !important;
-                bottom: 12px !important;
-                padding: 6px !important;
-                border-radius: 14px !important;
-            }
+            .hero h1 { font-size: 30px; }
+            .card { padding: 14px; border-radius: 18px; }
+            .passitan-card { padding: 12px; border-radius: 14px; }
+            .passitan-card-word { font-size: 19px; }
+            .passitan-card-example { font-size: 14px; }
+            .passitan-next-wrap { right: 12px; bottom: 12px; padding: 6px; }
         }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
-    # 表形式ヘッダー：意味列は削除。意味は英単語の hover tooltip で表示。
-    h_no, h_word, h_example, h_known, h_add = st.columns([0.34, 1.55, 6.0, 0.72, 0.82], gap=None)
-    h_no.markdown('<div class="passitan-table-header">No.</div>', unsafe_allow_html=True)
-    h_word.markdown('<div class="passitan-table-header">英単語</div>', unsafe_allow_html=True)
-    h_example.markdown('<div class="passitan-table-header">例文</div>', unsafe_allow_html=True)
-    h_known.markdown('<div class="passitan-table-header">Known</div>', unsafe_allow_html=True)
-    h_add.markdown('<div class="passitan-table-header">単語帳</div>', unsafe_allow_html=True)
+    if view.empty:
+        st.info("表示する単語がありません。")
+        return
 
-    for _, row in view.iterrows():
-        row_id = int(row["id"])
-        no = int(row["no"])
-        word = str(row.get("word", ""))
-        meaning = str(row.get("meaning", ""))
-        example = str(row.get("example_sentence", ""))
-        is_known = bool(int(row.get("known") or 0))
+    if view_mode == "スマホカード":
+        for _, row in view.iterrows():
+            row_id = int(row["id"])
+            no = int(row["no"])
+            word = str(row.get("word", ""))
+            meaning = str(row.get("meaning", ""))
+            example = str(row.get("example_sentence", ""))
+            is_known = bool(int(row.get("known") or 0))
 
-        safe_word = html.escape(word)
-        safe_meaning = html.escape(meaning)
-        safe_example = html.escape(example)
+            safe_word = html.escape(word)
+            safe_meaning = html.escape(meaning)
+            safe_example = html.escape(example)
 
-        c_no, c_word, c_example, c_known, c_add = st.columns([0.34, 1.55, 6.0, 0.72, 0.82], gap=None)
-
-        with c_no:
-            st.markdown(
-                f'<div class="passitan-cell passitan-cell-center passitan-no-cell"><span class="passitan-row-marker"></span><b>{no}</b></div>',
-                unsafe_allow_html=True,
-            )
-
-        with c_word:
-            st.markdown(
-                f'<div class="passitan-cell"><span class="passitan-word" title="{safe_meaning}">{safe_word}</span></div>',
-                unsafe_allow_html=True,
-            )
-
-        with c_example:
-            st.markdown(f'<div class="passitan-cell"><div class="passitan-example">{safe_example}</div></div>', unsafe_allow_html=True)
-
-        with c_known:
-            checked = st.checkbox(
-                " ",
-                value=is_known,
-                key=f"known_{row_id}",
-                label_visibility="collapsed",
-            )
-            if checked != is_known:
-                update_passitan_known(row_id, checked)
-                st.rerun()
-
-        with c_add:
-            if st.button("登録", key=f"add_passitan_vocab_{row_id}"):
-                ok, msg = add_vocab_word(
-                    word,
-                    meaning=meaning,
-                    japanese_translation=meaning,
-                    explanation="英検準1級でる順パス単から登録",
-                    example_sentence=example,
-                    note="パス単リストから登録",
-                )
-                st.success(msg) if ok else st.error(msg)
-
-
-    # スマホ用カード表示。PCではCSSで非表示、スマホではPC用表を非表示にしてこちらを表示する。
-    for _, row in view.iterrows():
-        row_id = int(row["id"])
-        no = int(row["no"])
-        word = str(row.get("word", ""))
-        meaning = str(row.get("meaning", ""))
-        example = str(row.get("example_sentence", ""))
-        is_known = bool(int(row.get("known") or 0))
-
-        safe_word = html.escape(word)
-        safe_meaning = html.escape(meaning)
-        safe_example = html.escape(example)
-
-        m_info, m_actions = st.columns([4.2, 1.0], gap=None)
-        with m_info:
             st.markdown(
                 f"""
-                <div class="passitan-mobile-card-marker"></div>
-                <div class="passitan-mobile-top">
-                    <span class="passitan-mobile-no">{no}</span>
-                    <span class="passitan-mobile-word" title="{safe_meaning}">{safe_word}</span>
+                <div class="passitan-card">
+                  <div class="passitan-card-top">
+                    <span class="passitan-card-no">{no}</span>
+                    <span class="passitan-card-word" title="{safe_meaning}">{safe_word}</span>
+                  </div>
+                  <p class="passitan-card-meaning">{safe_meaning}</p>
+                  <p class="passitan-card-example">{safe_example}</p>
                 </div>
-                <p class="passitan-mobile-example">{safe_example}</p>
                 """,
                 unsafe_allow_html=True,
             )
-        with m_actions:
-            checked_mobile = st.checkbox(
-                "Known",
-                value=is_known,
-                key=f"known_mobile_{row_id}",
-            )
-            if checked_mobile != is_known:
-                update_passitan_known(row_id, checked_mobile)
-                st.rerun()
-
-            if st.button("登録", key=f"add_passitan_vocab_mobile_{row_id}"):
-                ok, msg = add_vocab_word(
-                    word,
-                    meaning=meaning,
-                    japanese_translation=meaning,
-                    explanation="英検準1級でる順パス単から登録",
-                    example_sentence=example,
-                    note="パス単リストから登録",
+            a1, a2 = st.columns([1, 1])
+            with a1:
+                checked = st.checkbox(
+                    "Known",
+                    value=is_known,
+                    key=f"known_card_{row_id}",
                 )
-                st.success(msg) if ok else st.error(msg)
+                if checked != is_known:
+                    update_passitan_known(row_id, checked)
+                    st.rerun()
+            with a2:
+                if st.button("登録", key=f"add_passitan_vocab_card_{row_id}", use_container_width=True):
+                    ok, msg = add_vocab_word(
+                        word,
+                        meaning=meaning,
+                        japanese_translation=meaning,
+                        explanation="英検準1級でる順パス単から登録",
+                        example_sentence=example,
+                        note="パス単リストから登録",
+                    )
+                    st.success(msg) if ok else st.error(msg)
+    else:
+        h_no, h_word, h_example, h_known, h_add = st.columns([0.38, 1.55, 5.8, 0.78, 0.86], gap=None)
+        h_no.markdown('<div class="passitan-table-header passitan-cell-center passitan-table-row">No.</div>', unsafe_allow_html=True)
+        h_word.markdown('<div class="passitan-table-header passitan-table-row">英単語</div>', unsafe_allow_html=True)
+        h_example.markdown('<div class="passitan-table-header passitan-table-row">例文</div>', unsafe_allow_html=True)
+        h_known.markdown('<div class="passitan-table-header passitan-cell-center passitan-table-row">Known</div>', unsafe_allow_html=True)
+        h_add.markdown('<div class="passitan-table-header passitan-cell-center passitan-table-row">単語帳</div>', unsafe_allow_html=True)
+
+        for _, row in view.iterrows():
+            row_id = int(row["id"])
+            no = int(row["no"])
+            word = str(row.get("word", ""))
+            meaning = str(row.get("meaning", ""))
+            example = str(row.get("example_sentence", ""))
+            is_known = bool(int(row.get("known") or 0))
+
+            safe_word = html.escape(word)
+            safe_meaning = html.escape(meaning)
+            safe_example = html.escape(example)
+
+            c_no, c_word, c_example, c_known, c_add = st.columns([0.38, 1.55, 5.8, 0.78, 0.86], gap=None)
+            with c_no:
+                st.markdown(f'<div class="passitan-cell passitan-cell-center passitan-table-row"><b>{no}</b></div>', unsafe_allow_html=True)
+            with c_word:
+                st.markdown(f'<div class="passitan-cell passitan-table-row"><span class="passitan-word" title="{safe_meaning}">{safe_word}</span></div>', unsafe_allow_html=True)
+            with c_example:
+                st.markdown(f'<div class="passitan-cell passitan-table-row"><div class="passitan-example">{safe_example}</div></div>', unsafe_allow_html=True)
+            with c_known:
+                checked = st.checkbox(
+                    " ",
+                    value=is_known,
+                    key=f"known_table_{row_id}",
+                    label_visibility="collapsed",
+                )
+                if checked != is_known:
+                    update_passitan_known(row_id, checked)
+                    st.rerun()
+            with c_add:
+                if st.button("登録", key=f"add_passitan_vocab_table_{row_id}"):
+                    ok, msg = add_vocab_word(
+                        word,
+                        meaning=meaning,
+                        japanese_translation=meaning,
+                        explanation="英検準1級でる順パス単から登録",
+                        example_sentence=example,
+                        note="パス単リストから登録",
+                    )
+                    st.success(msg) if ok else st.error(msg)
 
     next_start = int(start_no) + int(display_n)
     max_no = int(passitan_df["no"].max())
