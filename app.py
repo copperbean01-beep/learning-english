@@ -25,7 +25,13 @@ except ModuleNotFoundError:
 from data_seed import SEED_QUESTIONS
 
 APP_DIR = Path(__file__).resolve().parent
-DB_PATH = APP_DIR / "eiken_vocab.db"
+
+# 通常は eiken_vocab.db を使います。
+# ただし、英検1級を追加したDB名が eiken_vocab_with_passitan.db の場合は、
+# そのDBを優先して読み込みます。
+DEFAULT_DB_PATH = APP_DIR / "eiken_vocab.db"
+PASSITAN_DB_PATH = APP_DIR / "eiken_vocab_with_passitan.db"
+DB_PATH = PASSITAN_DB_PATH if PASSITAN_DB_PATH.exists() else DEFAULT_DB_PATH
 EXPORT_DIR = APP_DIR / "exports"
 
 st.set_page_config(
@@ -269,6 +275,43 @@ def load_passitan_words():
         df = pd.DataFrame()
     con.close()
     return df
+
+
+def passitan_grade_label(source):
+    """source文字列から、パス単画面で使う教材名を作ります。"""
+    src = str(source or "").replace("１", "1")
+    if "準1級" in src or "準1" in src or "Pre-1" in src:
+        return "英検準1級"
+    if "英検1級" in src or "Grade 1" in src or "EJQuotes" in src:
+        return "英検1級"
+    return src or "その他"
+
+
+def passitan_display_no(row):
+    """英検1級の取り込み時にnoteへ保存された元No.を表示用No.として使います。"""
+    note = str(row.get("note", "") or "")
+    m = None
+    try:
+        import re
+        m = re.search(r"source_no=(\d+)", note)
+    except Exception:
+        m = None
+    if m:
+        return int(m.group(1))
+    try:
+        return int(row.get("no", 0))
+    except Exception:
+        return 0
+
+
+def passitan_key_slug(label):
+    return (
+        str(label)
+        .replace("英検", "eiken")
+        .replace("準", "pre")
+        .replace("級", "")
+        .replace(" ", "_")
+    )
 
 
 def update_passitan_known(row_id, known):
@@ -1259,12 +1302,12 @@ def render_browser_speak_button(word, key, label="🔊", height=34):
     )
 
 def passitan_page():
-    st.subheader("📗 英検準1級 でる順パス単")
-    st.caption("スマホではカード表示、PCでは表表示を選べます。🔊ボタンでブラウザ音声読み上げができます。意味は英単語にマウスを置くと表示されます。")
+    st.subheader("📗 パス単")
+    st.caption("英検準1級・英検1級を切り替えて学習できます。スマホではカード表示、PCでは表表示を選べます。🔊ボタンでブラウザ音声読み上げができます。")
 
-    passitan_df = load_passitan_words()
+    passitan_all_df = load_passitan_words()
 
-    if passitan_df.empty:
+    if passitan_all_df.empty:
         st.warning("パス単データがDBに入っていません。CSVをアップロードして取り込んでください。")
         uploaded = st.file_uploader("パス単CSVをアップロード", type=["csv"])
         if uploaded is not None:
@@ -1274,23 +1317,47 @@ def passitan_page():
                 st.rerun()
         return
 
+    passitan_all_df = passitan_all_df.copy()
+    passitan_all_df["grade_label"] = passitan_all_df["source"].apply(passitan_grade_label)
+    passitan_all_df["display_no"] = passitan_all_df.apply(passitan_display_no, axis=1)
+
+    preferred = ["英検準1級", "英検1級"]
+    existing_labels = passitan_all_df["grade_label"].dropna().astype(str).unique().tolist()
+    grade_options = [x for x in preferred if x in existing_labels] + [x for x in existing_labels if x not in preferred]
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    selected_grade = st.selectbox("教材を選択", grade_options, index=0, key="passitan_grade_select")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    passitan_df = passitan_all_df[passitan_all_df["grade_label"] == selected_grade].copy()
+    if passitan_df.empty:
+        st.warning(f"{selected_grade} のデータがDBにありません。")
+        return
+
     total = len(passitan_df)
     known_count = int(passitan_df["known"].fillna(0).astype(int).sum())
-    c1, c2, c3 = st.columns(3)
-    c1.metric("登録単語数", total)
-    c2.metric("わかった単語", known_count)
-    c3.metric("未チェック", total - known_count)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("選択中", selected_grade)
+    c2.metric("登録単語数", total)
+    c3.metric("わかった単語", known_count)
+    c4.metric("未チェック", total - known_count)
+
+    source_names = " / ".join(passitan_df["source"].dropna().astype(str).unique().tolist())
+    st.caption(f"現在のsource: {source_names}")
+
+    grade_slug = passitan_key_slug(selected_grade)
 
     st.markdown('<div class="card">', unsafe_allow_html=True)
     col_a, col_b, col_c, col_d, col_e = st.columns([1, 1, 2, 1, 1.2])
     with col_a:
-        display_n = st.selectbox("表示件数", [10, 20, 50], index=2)
+        display_n = st.selectbox("表示件数", [10, 20, 50], index=2, key=f"display_n_{grade_slug}")
     with col_b:
-        max_passitan_no = max(1, int(passitan_df["no"].max()))
-        if "passitan_start_no" not in st.session_state:
-            st.session_state["passitan_start_no"] = 1
-        st.session_state["passitan_start_no"] = min(
-            max(1, int(st.session_state["passitan_start_no"])),
+        max_passitan_no = max(1, int(passitan_df["display_no"].max()))
+        start_key = f"passitan_start_no_{grade_slug}"
+        if start_key not in st.session_state:
+            st.session_state[start_key] = 1
+        st.session_state[start_key] = min(
+            max(1, int(st.session_state[start_key])),
             max_passitan_no,
         )
         start_no = st.number_input(
@@ -1298,18 +1365,19 @@ def passitan_page():
             min_value=1,
             max_value=max_passitan_no,
             step=int(display_n),
-            key="passitan_start_no",
+            key=start_key,
         )
     with col_c:
-        keyword = st.text_input("検索", placeholder="例: affect / 影響")
+        keyword = st.text_input("検索", placeholder="例: affect / 影響", key=f"passitan_keyword_{grade_slug}")
     with col_d:
-        hide_known = st.checkbox("わかった単語を隠す", value=False)
+        hide_known = st.checkbox("わかった単語を隠す", value=False, key=f"hide_known_{grade_slug}")
     with col_e:
         view_mode = st.radio(
             "表示形式",
             ["スマホカード", "PC表"],
             index=0,
             horizontal=False,
+            key=f"view_mode_{grade_slug}",
             help="携帯電話では『スマホカード』を使うと表崩れを防げます。",
         )
     st.markdown('</div>', unsafe_allow_html=True)
@@ -1323,15 +1391,15 @@ def passitan_page():
             | view["example_sentence"].astype(str).str.lower().str.contains(k, na=False)
         ]
     else:
-        view = view[view["no"] >= int(start_no)]
+        view = view[view["display_no"] >= int(start_no)]
     if hide_known:
         view = view[view["known"].fillna(0).astype(int) == 0]
-    view = view.sort_values("no").head(display_n)
+    view = view.sort_values("display_no").head(display_n)
 
     st.download_button(
-        "パス単CSVをダウンロード",
+        f"{selected_grade} CSVをダウンロード",
         passitan_df.to_csv(index=False).encode("utf-8-sig"),
-        file_name="passitan_words_export.csv",
+        file_name=f"passitan_words_{grade_slug}.csv",
         mime="text/csv",
     )
 
@@ -1487,7 +1555,7 @@ def passitan_page():
     if view_mode == "スマホカード":
         for _, row in view.iterrows():
             row_id = int(row["id"])
-            no = int(row["no"])
+            no = int(row.get("display_no", row["no"]))
             word = str(row.get("word", ""))
             meaning = str(row.get("meaning", ""))
             example = str(row.get("example_sentence", ""))
@@ -1528,7 +1596,7 @@ def passitan_page():
                         word,
                         meaning=meaning,
                         japanese_translation=meaning,
-                        explanation="英検準1級でる順パス単から登録",
+                        explanation=f"{selected_grade} パス単から登録",
                         example_sentence=example,
                         note="パス単リストから登録",
                     )
@@ -1544,7 +1612,7 @@ def passitan_page():
 
         for _, row in view.iterrows():
             row_id = int(row["id"])
-            no = int(row["no"])
+            no = int(row.get("display_no", row["no"]))
             word = str(row.get("word", ""))
             meaning = str(row.get("meaning", ""))
             example = str(row.get("example_sentence", ""))
@@ -1580,21 +1648,21 @@ def passitan_page():
                         word,
                         meaning=meaning,
                         japanese_translation=meaning,
-                        explanation="英検準1級でる順パス単から登録",
+                        explanation=f"{selected_grade} パス単から登録",
                         example_sentence=example,
                         note="パス単リストから登録",
                     )
                     st.success(msg) if ok else st.error(msg)
 
     next_start = int(start_no) + int(display_n)
-    max_no = int(passitan_df["no"].max())
+    max_no = int(passitan_df["display_no"].max())
 
     def go_next_passitan():
-        st.session_state["passitan_start_no"] = min(next_start, max_no)
+        st.session_state[start_key] = min(next_start, max_no)
 
     if not keyword and next_start <= max_no:
         st.markdown('<div class="passitan-next-wrap">', unsafe_allow_html=True)
-        st.button("Next", key="passitan_next_bottom", on_click=go_next_passitan)
+        st.button("Next", key=f"passitan_next_bottom_{grade_slug}", on_click=go_next_passitan)
         st.markdown('</div>', unsafe_allow_html=True)
 
 def add_page():
