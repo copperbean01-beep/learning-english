@@ -2,6 +2,8 @@ import html
 import json
 import random
 import sqlite3
+import hashlib
+import secrets
 from pathlib import Path
 from datetime import date, timedelta
 
@@ -87,6 +89,117 @@ def connect():
 
 def today_iso():
     return date.today().isoformat()
+
+
+def normalize_email(email):
+    return str(email or "").strip().lower()
+
+
+def make_password_hash(password, salt=None):
+    """パスワードはDBへ平文保存せず、salt付きSHA-256で保存します。"""
+    salt = salt or secrets.token_hex(16)
+    password = str(password or "")
+    digest = hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+    return digest, salt
+
+
+def create_user(email, password):
+    email = normalize_email(email)
+    password = str(password or "")
+
+    if not email or "@" not in email:
+        return False, "正しいメールアドレスを入力してください。"
+    if len(password) < 6:
+        return False, "パスワードは6文字以上にしてください。"
+
+    password_hash, salt = make_password_hash(password)
+    con = connect()
+    try:
+        con.execute(
+            "INSERT INTO users (email, password_hash, salt) VALUES (?, ?, ?)",
+            (email, password_hash, salt),
+        )
+        con.commit()
+        return True, "登録しました。ログインしてください。"
+    except sqlite3.IntegrityError:
+        return False, "このメールアドレスはすでに登録されています。ログインしてください。"
+    finally:
+        con.close()
+
+
+def authenticate_user(email, password):
+    email = normalize_email(email)
+    con = connect()
+    try:
+        cur = con.cursor()
+        cur.execute("SELECT id, email, password_hash, salt FROM users WHERE email=?", (email,))
+        row = cur.fetchone()
+        if not row:
+            return False, "メールアドレスまたはパスワードが違います。"
+
+        user_id, user_email, stored_hash, salt = row
+        password_hash, _ = make_password_hash(password, salt=salt)
+        if not secrets.compare_digest(password_hash, stored_hash):
+            return False, "メールアドレスまたはパスワードが違います。"
+
+        con.execute("UPDATE users SET last_login_at=CURRENT_TIMESTAMP WHERE id=?", (int(user_id),))
+        con.commit()
+        st.session_state["auth_user_id"] = int(user_id)
+        st.session_state["auth_email"] = user_email
+        return True, "ログインしました。"
+    finally:
+        con.close()
+
+
+def logout_user():
+    for key in ["auth_user_id", "auth_email"]:
+        st.session_state.pop(key, None)
+
+
+def auth_page():
+    """ログイン前だけ表示する登録 / ログイン画面。"""
+    st.markdown(
+        """
+        <div class="hero">
+          <span class="pill">Login Required</span><span class="pill">Email Account</span>
+          <h1>英検語彙ダッシュボード</h1>
+          <p>メールアドレスで登録またはログインしてから、サービスを使用できます。</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    login_tab, register_tab = st.tabs(["ログイン", "新規登録"])
+
+    with login_tab:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        with st.form("login_form"):
+            email = st.text_input("メールアドレス", key="login_email")
+            password = st.text_input("パスワード", type="password", key="login_password")
+            submitted = st.form_submit_button("ログイン", type="primary")
+            if submitted:
+                ok, msg = authenticate_user(email, password)
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    with register_tab:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        with st.form("register_form"):
+            email = st.text_input("登録メールアドレス", key="register_email")
+            password = st.text_input("登録パスワード（6文字以上）", type="password", key="register_password")
+            password2 = st.text_input("登録パスワード（確認）", type="password", key="register_password2")
+            submitted = st.form_submit_button("登録する", type="primary")
+            if submitted:
+                if password != password2:
+                    st.error("確認用パスワードが一致しません。")
+                else:
+                    ok, msg = create_user(email, password)
+                    st.success(msg) if ok else st.error(msg)
+        st.markdown('</div>', unsafe_allow_html=True)
 
 
 def ensure_user_vocab_columns(cur):
@@ -185,6 +298,19 @@ def init_db():
             note TEXT DEFAULT '',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            salt TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_login_at TEXT DEFAULT ''
         )
         """
     )
@@ -312,6 +438,33 @@ def passitan_key_slug(label):
         .replace("級", "")
         .replace(" ", "_")
     )
+
+def build_passitan_sections(max_no, section_size=100, fixed_count=None):
+    """パス単を section_size 語ごとのSectionに分けます。例: Section 1 = 1〜100。"""
+    try:
+        max_no = int(max_no)
+    except Exception:
+        max_no = 0
+
+    if fixed_count is None:
+        section_count = max(1, (max_no + section_size - 1) // section_size)
+    else:
+        section_count = int(fixed_count)
+
+    sections = []
+    for i in range(1, section_count + 1):
+        start = (i - 1) * section_size + 1
+        end = i * section_size
+        if fixed_count is None:
+            end = min(end, max_no)
+        sections.append({
+            "section": i,
+            "start": start,
+            "end": end,
+            "label": f"Section {i}: {start}〜{end}",
+        })
+    return sections
+
 
 
 def update_passitan_known(row_id, known):
@@ -782,10 +935,16 @@ def render_hero(df):
 
 def sidebar_filters(df):
     st.sidebar.title("📘 Menu")
+    if st.session_state.get("auth_email"):
+        st.sidebar.caption(f"ログイン中: {st.session_state['auth_email']}")
+        if st.sidebar.button("ログアウト"):
+            logout_user()
+            st.rerun()
+    st.sidebar.divider()
 
     page = st.sidebar.radio(
         "画面",
-        ["🏠 Overview", "📚 試験問題", "🧠 Quiz", "📗 パス単", "📝 単語帳", "📄 PDF生成", "➕ 問題を追加", "🛠 データ管理"],
+        ["🏠 Overview", "📚 試験問題", "🧠 Quiz", "📗 パス単", "🧪 パス単テスト", "📝 単語帳", "📄 PDF生成", "➕ 問題を追加", "🛠 データ管理"],
         label_visibility="collapsed",
     )
 
@@ -888,11 +1047,7 @@ def render_card(row, show_answer=True):
                 synonyms=row.get("synonyms", ""),
                 note="試験問題から登録",
             )
-            # st.success(msg) if ok else st.error(msg)
-            if ok:
-                st.success(msg)
-            else:
-                st.error(msg)
+            st.success(msg) if ok else st.error(msg)
 
         with st.expander("わからない選択肢を単語帳に登録"):
             for idx, ch in enumerate(choices, start=1):
@@ -911,10 +1066,7 @@ def render_card(row, show_answer=True):
                         synonyms="",
                         note="試験問題の選択肢から登録",
                     )
-                    if ok:
-                        st.success(msg)
-                    else:
-                        st.error(msg)
+                    st.success(msg) if ok else st.error(msg)
     st.markdown('</div>', unsafe_allow_html=True)
 
 
@@ -1028,10 +1180,7 @@ def quiz_page(df):
                 synonyms=row.get("synonyms", ""),
                 note="Quizから登録",
             )
-            if ok:
-                st.success(msg)
-            else:
-                st.error(msg)
+            st.success(msg) if ok else st.error(msg)
 
         with st.expander("わからない選択肢を単語帳に登録"):
             for idx, ch in enumerate(row["choices"], start=1):
@@ -1050,10 +1199,7 @@ def quiz_page(df):
                         synonyms="",
                         note="Quizの選択肢から登録",
                     )
-                    if ok:
-                        st.success(msg)
-                    else:
-                        st.error(msg)
+                    st.success(msg) if ok else st.error(msg)
 
         c1, c2 = st.columns(2)
         with c1:
@@ -1144,10 +1290,7 @@ def vocab_page():
                         with col:
                             if st.button(label, key=f"review_{result}_{row['id']}"):
                                 ok, msg = review_vocab_word(row["id"], result)
-                                if ok:
-                                    st.success(msg)
-                                else:
-                                    st.error(msg)
+                                st.success(msg) if ok else st.error(msg)
                                 st.rerun()
                     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -1256,10 +1399,7 @@ def vocab_page():
                     synonyms=synonyms,
                     note=note,
                 )
-                if ok:
-                    st.success(msg)
-                else:
-                    st.error(msg)
+                st.success(msg) if ok else st.error(msg)
                 st.rerun()
 
 
@@ -1331,12 +1471,9 @@ def passitan_page():
         uploaded = st.file_uploader("パス単CSVをアップロード", type=["csv"])
         if uploaded is not None:
             ok, msg = import_passitan_csv_to_db(uploaded)
+            st.success(msg) if ok else st.error(msg)
             if ok:
-                st.success(msg)
-            else:
-                st.error(msg)
-            # if ok:
-            #    st.rerun()
+                st.rerun()
         return
 
     passitan_all_df = passitan_all_df.copy()
@@ -1370,38 +1507,78 @@ def passitan_page():
     grade_slug = passitan_key_slug(selected_grade)
 
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    col_a, col_b, col_c, col_d, col_e = st.columns([1, 1, 2, 1, 1.2])
-    with col_a:
-        display_n = st.selectbox("表示件数", [10, 20, 50], index=2, key=f"display_n_{grade_slug}")
-    with col_b:
-        max_passitan_no = max(1, int(passitan_df["display_no"].max()))
-        start_key = f"passitan_start_no_{grade_slug}"
-        if start_key not in st.session_state:
-            st.session_state[start_key] = 1
-        st.session_state[start_key] = min(
-            max(1, int(st.session_state[start_key])),
-            max_passitan_no,
-        )
-        start_no = st.number_input(
-            "開始No",
-            min_value=1,
-            max_value=max_passitan_no,
-            step=int(display_n),
-            key=start_key,
-        )
-    with col_c:
-        keyword = st.text_input("検索", placeholder="例: affect / 影響", key=f"passitan_keyword_{grade_slug}")
-    with col_d:
-        hide_known = st.checkbox("わかった単語を隠す", value=False, key=f"hide_known_{grade_slug}")
-    with col_e:
-        view_mode = st.radio(
-            "表示形式",
-            ["スマホカード", "PC表"],
-            index=0,
-            horizontal=False,
-            key=f"view_mode_{grade_slug}",
-            help="携帯電話では『スマホカード』を使うと表崩れを防げます。",
-        )
+
+    max_passitan_no = max(1, int(passitan_df["display_no"].max()))
+    is_pre1_passitan = selected_grade == "英検準1級"
+    start_no = 1
+    end_no = max_passitan_no
+    display_n = 100 if is_pre1_passitan else 50
+    section_key = f"passitan_section_{grade_slug}"
+    start_key = f"passitan_start_no_{grade_slug}"
+
+    if is_pre1_passitan:
+        sections = build_passitan_sections(max_passitan_no, section_size=100, fixed_count=19)
+        if section_key not in st.session_state:
+            st.session_state[section_key] = sections[0]["label"]
+        valid_section_labels = [sec["label"] for sec in sections]
+        if st.session_state[section_key] not in valid_section_labels:
+            st.session_state[section_key] = valid_section_labels[0]
+
+        col_a, col_b, col_c, col_d = st.columns([1.4, 2, 1, 1.2])
+        with col_a:
+            selected_section_label = st.selectbox(
+                "Sectionを選択",
+                valid_section_labels,
+                key=section_key,
+            )
+        selected_section = next(sec for sec in sections if sec["label"] == selected_section_label)
+        start_no = int(selected_section["start"])
+        end_no = int(selected_section["end"])
+        with col_b:
+            keyword = st.text_input("検索", placeholder="例: affect / 影響", key=f"passitan_keyword_{grade_slug}")
+        with col_c:
+            hide_known = st.checkbox("わかった単語を隠す", value=False, key=f"hide_known_{grade_slug}")
+        with col_d:
+            view_mode = st.radio(
+                "表示形式",
+                ["スマホカード", "PC表"],
+                index=0,
+                horizontal=False,
+                key=f"view_mode_{grade_slug}",
+                help="携帯電話では『スマホカード』を使うと表崩れを防げます。",
+            )
+        st.info(f"{selected_section_label} を表示します。範囲: No.{start_no}〜No.{end_no}（100語）")
+    else:
+        col_a, col_b, col_c, col_d, col_e = st.columns([1, 1, 2, 1, 1.2])
+        with col_a:
+            display_n = st.selectbox("表示件数", [10, 20, 50], index=2, key=f"display_n_{grade_slug}")
+        with col_b:
+            if start_key not in st.session_state:
+                st.session_state[start_key] = 1
+            st.session_state[start_key] = min(
+                max(1, int(st.session_state[start_key])),
+                max_passitan_no,
+            )
+            start_no = st.number_input(
+                "開始No",
+                min_value=1,
+                max_value=max_passitan_no,
+                step=int(display_n),
+                key=start_key,
+            )
+        with col_c:
+            keyword = st.text_input("検索", placeholder="例: affect / 影響", key=f"passitan_keyword_{grade_slug}")
+        with col_d:
+            hide_known = st.checkbox("わかった単語を隠す", value=False, key=f"hide_known_{grade_slug}")
+        with col_e:
+            view_mode = st.radio(
+                "表示形式",
+                ["スマホカード", "PC表"],
+                index=0,
+                horizontal=False,
+                key=f"view_mode_{grade_slug}",
+                help="携帯電話では『スマホカード』を使うと表崩れを防げます。",
+            )
     st.markdown('</div>', unsafe_allow_html=True)
 
     view = passitan_df.copy()
@@ -1412,11 +1589,15 @@ def passitan_page():
             | view["meaning"].astype(str).str.lower().str.contains(k, na=False)
             | view["example_sentence"].astype(str).str.lower().str.contains(k, na=False)
         ]
+    elif is_pre1_passitan:
+        view = view[(view["display_no"] >= int(start_no)) & (view["display_no"] <= int(end_no))]
     else:
         view = view[view["display_no"] >= int(start_no)]
     if hide_known:
         view = view[view["known"].fillna(0).astype(int) == 0]
-    view = view.sort_values("display_no").head(display_n)
+    view = view.sort_values("display_no")
+    if not is_pre1_passitan:
+        view = view.head(display_n)
 
     st.download_button(
         f"{selected_grade} CSVをダウンロード",
@@ -1474,7 +1655,7 @@ def passitan_page():
         }
         .passitan-card-example {
             color: #d7e2f5;
-            font-size: 15px;
+            font-size: 20px !important;
             line-height: 1.45;
             margin: 0;
             overflow-wrap: anywhere;
@@ -1514,7 +1695,7 @@ def passitan_page():
         .passitan-example {
             width: 100%;
             color: #d7e2f5;
-            font-size: 15px;
+            font-size: 30px;
             white-space: nowrap;
             overflow: hidden;
             text-overflow: ellipsis;
@@ -1562,7 +1743,7 @@ def passitan_page():
             .card { padding: 14px; border-radius: 18px; }
             .passitan-card { padding: 12px; border-radius: 14px; }
             .passitan-card-word { font-size: 19px; }
-            .passitan-card-example { font-size: 14px; }
+            .passitan-card-example { font-size: 30px; }
             .passitan-next-wrap { right: 12px; bottom: 12px; padding: 6px; }
         }
         </style>
@@ -1585,6 +1766,8 @@ def passitan_page():
 
             safe_word = html.escape(word)
             safe_meaning = html.escape(meaning)
+
+            # hint_example = make_example_with_word_hint(example, word, hint_len=2)
             safe_example = html.escape(example)
 
             st.markdown(
@@ -1622,12 +1805,7 @@ def passitan_page():
                         example_sentence=example,
                         note="パス単リストから登録",
                     )
-                    # st.success(msg) if ok else st.error(msg)
-                    if ok:
-                        st.success(msg)
-                    else:
-                        st.error(msg)
-
+                    st.success(msg) if ok else st.error(msg)
     else:
         h_no, h_word, h_speak, h_example, h_known, h_add = st.columns([0.38, 1.45, 0.56, 5.5, 0.78, 0.86], gap=None)
         h_no.markdown('<div class="passitan-table-header passitan-cell-center passitan-table-row">No.</div>', unsafe_allow_html=True)
@@ -1647,7 +1825,9 @@ def passitan_page():
 
             safe_word = html.escape(word)
             safe_meaning = html.escape(meaning)
-            safe_example = html.escape(example)
+
+            hint_example = make_example_with_word_hint(example, word, hint_len=2)
+            safe_example = html.escape(hint_example)
 
             c_no, c_word, c_speak, c_example, c_known, c_add = st.columns([0.38, 1.45, 0.56, 5.5, 0.78, 0.86], gap=None)
             with c_no:
@@ -1679,20 +1859,327 @@ def passitan_page():
                         example_sentence=example,
                         note="パス単リストから登録",
                     )
-                    if ok:
-                        st.success(msg)
-                    else:
-                        st.error(msg)
+                    st.success(msg) if ok else st.error(msg)
 
-    next_start = int(start_no) + int(display_n)
     max_no = int(passitan_df["display_no"].max())
 
-    def go_next_passitan():
-        st.session_state[start_key] = min(next_start, max_no)
+    if is_pre1_passitan:
+        sections = build_passitan_sections(max_no, section_size=100, fixed_count=19)
+        current_idx = next((i for i, sec in enumerate(sections) if sec["start"] == int(start_no)), 0)
 
-    if not keyword and next_start <= max_no:
-        st.markdown('<div class="passitan-next-wrap">', unsafe_allow_html=True)
-        st.button("Next", key=f"passitan_next_bottom_{grade_slug}", on_click=go_next_passitan)
+        def go_next_passitan_section():
+            if current_idx + 1 < len(sections):
+                st.session_state[section_key] = sections[current_idx + 1]["label"]
+
+        if not keyword and current_idx + 1 < len(sections):
+            st.markdown('<div class="passitan-next-wrap">', unsafe_allow_html=True)
+            st.button("Next Section", key=f"passitan_next_section_bottom_{grade_slug}", on_click=go_next_passitan_section)
+            st.markdown('</div>', unsafe_allow_html=True)
+    else:
+        next_start = int(start_no) + int(display_n)
+
+        def go_next_passitan():
+            st.session_state[start_key] = min(next_start, max_no)
+
+        if not keyword and next_start <= max_no:
+            st.markdown('<div class="passitan-next-wrap">', unsafe_allow_html=True)
+            st.button("Next", key=f"passitan_next_bottom_{grade_slug}", on_click=go_next_passitan)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+
+def make_example_with_word_hint(example, word, hint_len=2):
+    """
+    例文中の英単語を、頭文字だけ残して残りを ____ にする。
+    例: abandon -> ab____
+    """
+    import re
+
+    example = str(example or "")
+    word = str(word or "").strip()
+
+    if not example or not word:
+        return example
+
+    hint = word[:hint_len]
+    # hidden = hint + "____"
+    rest_len = max(len(word) - hint_len, 0)
+
+    # 大文字小文字を無視して、単語単位で置換
+    pattern = re.compile(rf"\b{re.escape(word)}\b", re.IGNORECASE)
+
+    underscores = "&thinsp;".join(["_"] * rest_len)
+    hidden = f"{hint}&thinsp;{underscores}" if underscores else hint
+
+    # 例文に単語がある場合だけ置換
+    if pattern.search(example):
+        return pattern.sub(hidden, example)
+
+    # 例文に単語が見つからない場合は、例文の後ろにヒントを付ける
+    return f"{example}  ({hidden})"
+
+def normalize_typed_answer(text_value):
+    """タイピング回答の比較用に、大小文字・前後空白・連続スペースを吸収します。"""
+    return " ".join(str(text_value or "").strip().lower().split())
+
+
+def split_word_prefix(word, prefix_len=2):
+    """テスト用に、英単語の頭文字だけをヒントとして分離します。"""
+    word = str(word or "").strip()
+    if not word:
+        return "", ""
+    prefix_len = min(int(prefix_len), len(word))
+    return word[:prefix_len], word[prefix_len:]
+
+
+def build_typed_full_answer(prefix, rest_text):
+    """頭文字ヒント + タイピングした残り部分を結合して採点用の回答にします。"""
+    return f"{str(prefix or '')}{str(rest_text or '').strip()}"
+
+
+def blank_word_in_example(example, word, hint_len=2):
+    import re
+
+    example = str(example or "")
+    word = str(word or "").strip()
+
+    if not example or not word:
+        return example
+
+    hint = word[:hint_len]
+    rest_len = max(len(word) - hint_len, 0)
+
+    # 狭い隙間：&thinsp; を使う
+    underscores = "&thinsp;".join(["_"] * rest_len)
+    hidden = f"{hint}&thinsp;{underscores}" if underscores else hint
+
+    pattern = re.compile(rf"\b{re.escape(word)}\b", re.IGNORECASE)
+
+    if pattern.search(example):
+        return pattern.sub(hidden, example)
+
+    return f"{example}  ({hidden})"
+
+def build_passitan_test_scope_options(passitan_df, selected_grade):
+    """パス単テスト用のSection選択肢を作ります。準1級はSection 1〜19 + All sections。"""
+    max_no = max(1, int(passitan_df["display_no"].max()))
+    if selected_grade == "英検準1級":
+        sections = build_passitan_sections(max_no, section_size=100, fixed_count=19)
+    else:
+        sections = build_passitan_sections(max_no, section_size=100, fixed_count=None)
+
+    options = [{"label": f"All sections: 1〜{max_no}", "start": 1, "end": max_no, "is_all": True}]
+    for sec in sections:
+        options.append({"label": sec["label"], "start": sec["start"], "end": sec["end"], "is_all": False})
+    return options
+
+
+def passitan_test_page():
+    st.subheader("🧪 パス単テスト")
+    st.caption("日本語の意味を非表示にして、音声または例文ヒントを使いながら、頭文字2文字以外の残りをタイピングします。最後にまとめてチェックできます。")
+
+    passitan_all_df = load_passitan_words()
+    if passitan_all_df.empty:
+        st.warning("パス単データがDBに入っていません。まず『📗 パス単』画面でCSVをアップロードしてください。")
+        return
+
+    passitan_all_df = passitan_all_df.copy()
+    passitan_all_df["grade_label"] = passitan_all_df["source"].apply(passitan_grade_label)
+    passitan_all_df["display_no"] = passitan_all_df.apply(passitan_display_no, axis=1)
+
+    preferred = ["英検準1級", "英検1級"]
+    existing_labels = passitan_all_df["grade_label"].dropna().astype(str).unique().tolist()
+    grade_options = [x for x in preferred if x in existing_labels] + [x for x in existing_labels if x not in preferred]
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    c_grade, c_scope, c_count, c_mode = st.columns([1.2, 2.0, 1.2, 1.2])
+    with c_grade:
+        selected_grade = st.selectbox("教材を選択", grade_options, index=0, key="passitan_test_grade")
+
+    passitan_df = passitan_all_df[passitan_all_df["grade_label"] == selected_grade].copy()
+    if passitan_df.empty:
+        st.warning(f"{selected_grade} のデータがDBにありません。")
+        st.markdown('</div>', unsafe_allow_html=True)
+        return
+
+    scope_options = build_passitan_test_scope_options(passitan_df, selected_grade)
+    scope_labels = [opt["label"] for opt in scope_options]
+    with c_scope:
+        selected_scope_label = st.selectbox("出題範囲", scope_labels, index=1 if len(scope_labels) > 1 else 0, key=f"passitan_test_scope_{passitan_key_slug(selected_grade)}")
+    selected_scope = next(opt for opt in scope_options if opt["label"] == selected_scope_label)
+
+    scoped_df = passitan_df[
+        (passitan_df["display_no"] >= int(selected_scope["start"]))
+        & (passitan_df["display_no"] <= int(selected_scope["end"]))
+    ].sort_values("display_no").copy()
+
+    with c_count:
+        count_options = ["10問", "20問", "50問", "100問", "選択範囲すべて"]
+        selected_count = st.selectbox("出題数", count_options, index=1, key=f"passitan_test_count_{passitan_key_slug(selected_grade)}")
+    with c_mode:
+        order_mode = st.radio("順番", ["順番通り", "シャッフル"], index=0, key=f"passitan_test_order_{passitan_key_slug(selected_grade)}")
+
+    c_audio, c_hint, c_known = st.columns([1, 1.2, 1.2])
+    with c_audio:
+        show_audio = st.checkbox("音声ボタンを表示", value=True, key=f"passitan_test_audio_{passitan_key_slug(selected_grade)}")
+    with c_hint:
+        show_example_hint = st.checkbox("例文ヒントを表示（日本語なし）", value=True, key=f"passitan_test_hint_{passitan_key_slug(selected_grade)}")
+    with c_known:
+        hide_known = st.checkbox("Knownを除外", value=False, key=f"passitan_test_hide_known_{passitan_key_slug(selected_grade)}")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    if hide_known:
+        scoped_df = scoped_df[scoped_df["known"].fillna(0).astype(int) == 0]
+
+    if scoped_df.empty:
+        st.info("この条件で出題できる単語がありません。")
+        return
+
+    if selected_count == "選択範囲すべて":
+        test_n = len(scoped_df)
+    else:
+        test_n = min(int(selected_count.replace("問", "")), len(scoped_df))
+
+    test_key_base = f"passitan_test_{passitan_key_slug(selected_grade)}_{selected_scope['start']}_{selected_scope['end']}_{test_n}_{order_mode}_{hide_known}"
+    if order_mode == "シャッフル":
+        seed_key = f"{test_key_base}_seed"
+        if seed_key not in st.session_state:
+            st.session_state[seed_key] = random.randint(1, 10_000_000)
+        test_df = scoped_df.sample(n=test_n, random_state=int(st.session_state[seed_key])).copy()
+    else:
+        test_df = scoped_df.head(test_n).copy()
+
+    st.info(f"出題範囲: {selected_scope_label} / 出題数: {len(test_df)}問。日本語の意味はチェック後に表示します。")
+
+    st.markdown(
+        """
+        <style>
+        .passitan-test-card {
+            padding: 12px 14px;
+            border-radius: 16px;
+            background: rgba(255,255,255,.045);
+            border: 1px solid rgba(255,255,255,.18);
+            margin: 0 0 10px 0;
+        }
+        .passitan-test-no {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 999px;
+            background: rgba(255,255,255,.13);
+            color: #dce8fb;
+            font-size: 12px;
+            font-weight: 850;
+            margin-bottom: 6px;
+        }
+        .passitan-test-example {
+            color: #d7e2f5;
+            font-size: 24px !important;
+            line-height: 2.55;
+            overflow-wrap: anywhere;
+            margin: 8px 0 12px 0;
+            font-weight: 750;
+        }
+        .passitan-test-prefix {
+            min-height: 25px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 12px;
+            background: rgba(79,172,254,.18);
+            border: 1px solid rgba(79,172,254,.35);
+            color: #ffffff;
+            font-size: 22px;
+            font-weight: 900;
+            letter-spacing: .04em;
+        }
+        .passitan-test-result-ok { color: #b7ffcf; font-weight: 850; }
+        .passitan-test-result-ng { color: #ffb7b7; font-weight: 850; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    answers = {}
+    rows = list(test_df.iterrows())
+    for idx, (_, row) in enumerate(rows, start=1):
+        row_id = int(row["id"])
+        no = int(row.get("display_no", row.get("no", 0)))
+        word = str(row.get("word", ""))
+        prefix_hint, _rest_hint = split_word_prefix(word, prefix_len=2)
+        example = str(row.get("example_sentence", ""))
+        hint_text = make_example_with_word_hint(example, word, hint_len=2) if show_example_hint else ""
+
+        st.markdown('<div class="passitan-test-card">', unsafe_allow_html=True)
+        st.markdown(f'<span class="passitan-test-no">Q{idx} / No.{no}</span>', unsafe_allow_html=True)
+        if hint_text:
+            # st.markdown(f'<p class="passitan-test-example">{html.escape(hint_text)}</p>', unsafe_allow_html=True)
+            st.markdown(f'<p class="passitan-test-example">{hint_text}</p>',unsafe_allow_html=True)
+
+        if show_audio:
+            c_speak, c_prefix, c_input = st.columns([0.7, 0.1, 2.0])
+            with c_speak:
+                render_browser_speak_button(word, key=f"test_{row_id}_{idx}", label="🔊", height=38)
+            # with c_prefix:
+            #     st.markdown(f'<div class="passitan-test-prefix">{html.escape(prefix_hint)}</div>', unsafe_allow_html=True)
+            with c_input:
+                answers[row_id] = st.text_input(
+                    "残りを入力",
+                    key=f"answer_{test_key_base}_{row_id}",
+                    label_visibility="collapsed",
+                    placeholder="3文字目以降を入力",
+                )
+        else:
+            c_prefix, c_input = st.columns([0.1, 2.0])
+            # with c_prefix:
+            #     st.markdown(f'<div class="passitan-test-prefix">{html.escape(prefix_hint)}</div>', unsafe_allow_html=True)
+            with c_input:
+                answers[row_id] = st.text_input(
+                    "残りを入力",
+                    key=f"answer_{test_key_base}_{row_id}",
+                    label_visibility="collapsed",
+                    placeholder="3文字目以降を入力",
+                )
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    c_check, c_shuffle = st.columns([1, 1])
+    with c_check:
+        checked = st.button("✅ 最後にチェックする", type="primary", key=f"check_{test_key_base}")
+    with c_shuffle:
+        if order_mode == "シャッフル" and st.button("🔄 シャッフルを更新", key=f"reshuffle_{test_key_base}"):
+            st.session_state[f"{test_key_base}_seed"] = random.randint(1, 10_000_000)
+            st.rerun()
+
+    if checked:
+        correct_count = 0
+        result_rows = []
+        for idx, (_, row) in enumerate(rows, start=1):
+            row_id = int(row["id"])
+            no = int(row.get("display_no", row.get("no", 0)))
+            correct_word = str(row.get("word", ""))
+            prefix_hint, _rest_hint = split_word_prefix(correct_word, prefix_len=2)
+            typed_rest = answers.get(row_id, "")
+            typed_full = build_typed_full_answer(prefix_hint, typed_rest)
+            ok = normalize_typed_answer(typed_full) == normalize_typed_answer(correct_word)
+            if ok:
+                correct_count += 1
+            result_rows.append({
+                "No": no,
+                "結果": "○" if ok else "×",
+                "入力": typed_full,
+                "正解": correct_word,
+                "意味": str(row.get("meaning", "")),
+                "例文": str(row.get("example_sentence", "")),
+            })
+
+        score_rate = correct_count / max(1, len(result_rows)) * 100
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown(f"### 結果: {correct_count} / {len(result_rows)} 問正解（{score_rate:.1f}%）")
+        if correct_count == len(result_rows):
+            st.success("全問正解です！")
+        elif score_rate >= 80:
+            st.success("かなり良いです。間違えた単語だけ復習しましょう。")
+        else:
+            st.warning("間違えた単語を確認して、もう一度テストしましょう。")
+        st.dataframe(pd.DataFrame(result_rows), use_container_width=True, hide_index=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
 def add_page():
@@ -1758,6 +2245,10 @@ def data_page(df):
 
 def main():
     init_db()
+    if not st.session_state.get("auth_user_id"):
+        auth_page()
+        return
+
     df = load_questions()
     page, selected, keyword, question_submenu = sidebar_filters(df)
     fdf = apply_filter(df, selected, keyword)
@@ -1769,6 +2260,8 @@ def main():
         quiz_page(fdf)
     elif page == "📗 パス単":
         passitan_page()
+    elif page == "🧪 パス単テスト":
+        passitan_test_page()
     elif page == "📝 単語帳":
         vocab_page()
     elif page == "📄 PDF生成":
