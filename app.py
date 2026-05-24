@@ -24,7 +24,12 @@ try:
 except ModuleNotFoundError:
     HAS_REPORTLAB = False
 
-from data_seed import SEED_QUESTIONS
+try:
+    from data_seed import SEED_QUESTIONS
+except ModuleNotFoundError:
+    # data_seed.py が同じフォルダに無い環境でも app.py 単体で起動できるようにします。
+    SEED_QUESTIONS = []
+
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -34,10 +39,19 @@ APP_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = APP_DIR / "eiken_vocab.db"
 PASSITAN_DB_PATH = APP_DIR / "eiken_vocab_with_passitan.db"
 DB_PATH = PASSITAN_DB_PATH if PASSITAN_DB_PATH.exists() else DEFAULT_DB_PATH
+# special-lesson 用DB。現在のファイル名 special_lesson.db を優先し、
+# 以前の english_exercises_answers_jp.db も互換のため読み込みます。
+SPECIAL_LESSON_DB_CANDIDATES = [
+    APP_DIR / "special_lesson.db",
+    APP_DIR / "english_exercises_answers_jp.db",
+    Path("/mnt/data/special_lesson.db"),
+    Path("/mnt/data/english_exercises_answers_jp.db"),
+]
+SPECIAL_LESSON_DB_PATH = next((p for p in SPECIAL_LESSON_DB_CANDIDATES if p.exists()), SPECIAL_LESSON_DB_CANDIDATES[0])
 EXPORT_DIR = APP_DIR / "exports"
 
 st.set_page_config(
-    page_title="Eiken Pre-1 Vocabulary Dashboard",
+    page_title="Learning Engish Dashbord",
     page_icon="📘",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -154,6 +168,534 @@ def authenticate_user(email, password):
 def logout_user():
     for key in ["auth_user_id", "auth_email"]:
         st.session_state.pop(key, None)
+
+
+def current_user_id():
+    """現在ログイン中のユーザーIDを返します。"""
+    try:
+        return int(st.session_state.get("auth_user_id") or 0)
+    except Exception:
+        return 0
+
+
+def load_user_progress(area, default=None):
+    """ユーザーごとの前回学習位置を読み込みます。"""
+    user_id = current_user_id()
+    if not user_id:
+        return default if default is not None else {}
+    con = connect()
+    try:
+        cur = con.cursor()
+        cur.execute(
+            "SELECT payload_json FROM user_progress WHERE user_id=? AND area=?",
+            (user_id, str(area)),
+        )
+        row = cur.fetchone()
+        if not row:
+            return default if default is not None else {}
+        data = json.loads(row[0] or "{}")
+        return data if isinstance(data, dict) else (default if default is not None else {})
+    except Exception:
+        return default if default is not None else {}
+    finally:
+        con.close()
+
+
+def save_user_progress(area, payload):
+    """ユーザーごとの前回学習位置を保存します。"""
+    user_id = current_user_id()
+    if not user_id:
+        return
+    try:
+        payload_json = json.dumps(payload or {}, ensure_ascii=False)
+        con = connect()
+        con.execute(
+            """
+            INSERT INTO user_progress (user_id, area, payload_json)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id, area) DO UPDATE SET
+                payload_json=excluded.payload_json,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (user_id, str(area), payload_json),
+        )
+        con.commit()
+    except Exception:
+        pass
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
+def set_session_default_from_progress(key, value, valid_values=None):
+    """Streamlit widget作成前に、保存済みの値を初期値として復元します。"""
+    if key in st.session_state or value is None:
+        return
+    if valid_values is not None and value not in valid_values:
+        return
+    st.session_state[key] = value
+
+def percent_value(completed, total):
+    """進捗率を0〜100で返します。"""
+    try:
+        total = int(total or 0)
+        completed = int(completed or 0)
+        if total <= 0:
+            return 0.0
+        return max(0.0, min(100.0, completed / total * 100))
+    except Exception:
+        return 0.0
+
+
+def save_study_progress(area, item_key, title, total_count=0, completed_count=0, unit="", section_no="", score_rate=None, status="学習中", payload=None):
+    """ユーザー別に、どこまで学習したかの最新状態を保存します。"""
+    user_id = current_user_id()
+    if not user_id:
+        return
+    try:
+        total_count = int(total_count or 0)
+        completed_count = int(completed_count or 0)
+        if score_rate is None:
+            score_rate = percent_value(completed_count, total_count)
+        payload_json = json.dumps(payload or {}, ensure_ascii=False)
+        con = connect()
+        con.execute(
+            """
+            INSERT INTO user_study_progress
+            (user_id, area, item_key, title, unit, section_no, total_count, completed_count, score_rate, status, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, area, item_key) DO UPDATE SET
+                title=excluded.title,
+                unit=excluded.unit,
+                section_no=excluded.section_no,
+                total_count=excluded.total_count,
+                completed_count=excluded.completed_count,
+                score_rate=excluded.score_rate,
+                status=excluded.status,
+                payload_json=excluded.payload_json,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (user_id, str(area), str(item_key), str(title), str(unit), str(section_no), total_count, completed_count, float(score_rate or 0), str(status), payload_json),
+        )
+        con.commit()
+    except Exception:
+        pass
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
+def add_study_event(area, event_type, title, total_count=0, completed_count=0, score_rate=None, payload=None):
+    """テスト完了・Confirmなどの学習履歴を時系列で保存します。"""
+    user_id = current_user_id()
+    if not user_id:
+        return
+    try:
+        total_count = int(total_count or 0)
+        completed_count = int(completed_count or 0)
+        if score_rate is None:
+            score_rate = percent_value(completed_count, total_count)
+        payload_json = json.dumps(payload or {}, ensure_ascii=False)
+        con = connect()
+        con.execute(
+            """
+            INSERT INTO user_study_events
+            (user_id, area, event_type, title, total_count, completed_count, score_rate, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, str(area), str(event_type), str(title), total_count, completed_count, float(score_rate or 0), payload_json),
+        )
+        con.commit()
+    except Exception:
+        pass
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
+def load_study_progress():
+    user_id = current_user_id()
+    if not user_id:
+        return pd.DataFrame()
+    con = connect()
+    try:
+        return pd.read_sql_query(
+            """
+            SELECT area, item_key, title, unit, section_no, total_count, completed_count, score_rate, status, updated_at
+            FROM user_study_progress
+            WHERE user_id=?
+            ORDER BY updated_at DESC
+            """,
+            con,
+            params=(user_id,),
+        )
+    finally:
+        con.close()
+
+
+def load_study_events(limit=200):
+    user_id = current_user_id()
+    if not user_id:
+        return pd.DataFrame()
+    con = connect()
+    try:
+        return pd.read_sql_query(
+            """
+            SELECT area, event_type, title, total_count, completed_count, score_rate, created_at
+            FROM user_study_events
+            WHERE user_id=?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            con,
+            params=(user_id, int(limit)),
+        )
+    finally:
+        con.close()
+
+def mask_email_for_ranking(email):
+    """ランキング表示用にメールアドレスを短く表示します。"""
+    email = str(email or "").strip()
+    if not email or "@" not in email:
+        return email or "unknown"
+    name, domain = email.split("@", 1)
+    if len(name) <= 2:
+        shown = name[:1] + "*"
+    else:
+        shown = name[:2] + "***"
+    return f"{shown}@{domain}"
+
+
+def load_all_user_progress_ranking():
+    """Overview用：全ユーザーの学習進捗ランキングを取得します。"""
+    con = connect()
+    try:
+        progress = pd.read_sql_query(
+            """
+            SELECT
+                u.id AS user_id,
+                u.email AS email,
+                COUNT(p.id) AS records,
+                COALESCE(SUM(p.total_count), 0) AS total_count,
+                COALESCE(SUM(p.completed_count), 0) AS completed_count,
+                COALESCE(AVG(p.score_rate), 0) AS avg_progress_rate,
+                MAX(p.updated_at) AS last_study_at
+            FROM users u
+            LEFT JOIN user_study_progress p ON p.user_id = u.id
+            GROUP BY u.id, u.email
+            """,
+            con,
+        )
+        events = pd.read_sql_query(
+            """
+            SELECT
+                user_id,
+                COUNT(id) AS test_count,
+                COALESCE(AVG(score_rate), 0) AS avg_test_rate,
+                COALESCE(MAX(score_rate), 0) AS best_test_rate,
+                MAX(created_at) AS last_test_at
+            FROM user_study_events
+            WHERE area IN ('passitan_test', 'special_lesson')
+            GROUP BY user_id
+            """,
+            con,
+        )
+    except Exception:
+        return pd.DataFrame()
+    finally:
+        con.close()
+
+    if progress.empty:
+        return progress
+
+    merged = progress.merge(events, on="user_id", how="left")
+    for col in ["records", "total_count", "completed_count", "test_count"]:
+        merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0).astype(int)
+    for col in ["avg_progress_rate", "avg_test_rate", "best_test_rate"]:
+        merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0.0)
+
+    merged["overall_rate"] = merged.apply(lambda r: percent_value(r["completed_count"], r["total_count"]), axis=1)
+    # 進捗率だけだと少数の学習でも上位になるため、完了数も少し加点します。
+    merged["rank_score"] = merged["overall_rate"] + (merged["completed_count"].clip(upper=500) / 500 * 10) + (merged["avg_test_rate"].fillna(0) * 0.05)
+    merged = merged.sort_values(["rank_score", "completed_count", "records"], ascending=[False, False, False]).reset_index(drop=True)
+    merged["rank"] = merged.index + 1
+    merged["display_user"] = merged["email"].apply(mask_email_for_ranking)
+    return merged
+
+
+def load_all_user_area_progress(area):
+    """Overview用：特定分野の全ユーザー進捗を取得します。"""
+    con = connect()
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT
+                u.id AS user_id,
+                u.email AS email,
+                COUNT(p.id) AS records,
+                COALESCE(SUM(p.total_count), 0) AS total_count,
+                COALESCE(SUM(p.completed_count), 0) AS completed_count,
+                COALESCE(AVG(p.score_rate), 0) AS avg_rate,
+                MAX(p.updated_at) AS last_study_at
+            FROM users u
+            JOIN user_study_progress p ON p.user_id = u.id
+            WHERE p.area=?
+            GROUP BY u.id, u.email
+            """,
+            con,
+            params=(str(area),),
+        )
+    except Exception:
+        return pd.DataFrame()
+    finally:
+        con.close()
+
+    if df.empty:
+        return df
+    for col in ["records", "total_count", "completed_count"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+    df["progress_rate"] = df.apply(lambda r: percent_value(r["completed_count"], r["total_count"]), axis=1)
+    df["display_user"] = df["email"].apply(mask_email_for_ranking)
+    df = df.sort_values(["progress_rate", "completed_count"], ascending=[False, False]).reset_index(drop=True)
+    df["rank"] = df.index + 1
+    return df
+
+
+def load_recent_all_user_study_events(limit=20):
+    """Overview用：全ユーザーの最近のテスト履歴を取得します。"""
+    con = connect()
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT
+                u.email AS email,
+                e.area,
+                e.event_type,
+                e.title,
+                e.total_count,
+                e.completed_count,
+                e.score_rate,
+                e.created_at
+            FROM user_study_events e
+            JOIN users u ON u.id = e.user_id
+            ORDER BY e.created_at DESC
+            LIMIT ?
+            """,
+            con,
+            params=(int(limit),),
+        )
+    except Exception:
+        return pd.DataFrame()
+    finally:
+        con.close()
+    if not df.empty:
+        df["display_user"] = df["email"].apply(mask_email_for_ranking)
+    return df
+
+
+def render_all_user_ranking_overview():
+    """Overviewに、全ユーザーの進捗・ランキングを表示します。"""
+    ranking_df = load_all_user_progress_ranking()
+
+    st.subheader("🏆 全ユーザーの勉強進捗・ランキング")
+    if ranking_df.empty:
+        st.info("まだ全ユーザーの学習記録がありません。パス単・パス単テスト・special-lessonを使うと自動で記録されます。")
+        return
+
+    active_df = ranking_df[ranking_df["records"] > 0].copy()
+    active_users = len(active_df)
+    total_users = len(ranking_df)
+    total_completed = int(ranking_df["completed_count"].sum())
+    avg_rate = float(active_df["overall_rate"].mean()) if active_users else 0.0
+
+    my_rank_text = "-"
+    uid = current_user_id()
+    if uid and uid in ranking_df["user_id"].tolist():
+        my_row = ranking_df[ranking_df["user_id"] == uid].iloc[0]
+        my_rank_text = f"{int(my_row['rank'])}位 / {total_users}人"
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("登録ユーザー", total_users)
+    c2.metric("学習記録あり", active_users)
+    c3.metric("全員の完了/正解数", total_completed)
+    c4.metric("自分の順位", my_rank_text)
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("### 総合ランキング")
+    show = ranking_df.copy()
+    show["overall_rate"] = show["overall_rate"].round(1)
+    show["avg_test_rate"] = show["avg_test_rate"].round(1)
+    show["best_test_rate"] = show["best_test_rate"].round(1)
+    show["last_study_at"] = show["last_study_at"].fillna("").astype(str)
+    ranking_view = show.rename(columns={
+        "rank": "順位",
+        "display_user": "ユーザー",
+        "overall_rate": "全体進捗%",
+        "records": "記録項目",
+        "completed_count": "完了/正解",
+        "total_count": "合計",
+        "test_count": "テスト回数",
+        "avg_test_rate": "平均テスト%",
+        "best_test_rate": "最高テスト%",
+        "last_study_at": "最終学習",
+    })
+    cols = ["順位", "ユーザー", "全体進捗%", "記録項目", "完了/正解", "合計", "テスト回数", "平均テスト%", "最高テスト%", "最終学習"]
+    st.dataframe(ranking_view[cols].head(20), use_container_width=True, hide_index=True)
+    st.caption(f"アクティブユーザー平均進捗: {avg_rate:.1f}%")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    passitan_rank = load_all_user_area_progress("passitan")
+    if not passitan_rank.empty:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown("### パス単 学習進捗ランキング")
+        pv = passitan_rank.copy()
+        pv["progress_rate"] = pv["progress_rate"].round(1)
+        pv = pv.rename(columns={
+            "rank": "順位",
+            "display_user": "ユーザー",
+            "progress_rate": "進捗%",
+            "completed_count": "Known/完了",
+            "total_count": "表示/学習数",
+            "records": "記録項目",
+            "last_study_at": "最終学習",
+        })
+        st.dataframe(pv[["順位", "ユーザー", "進捗%", "Known/完了", "表示/学習数", "記録項目", "最終学習"]].head(20), use_container_width=True, hide_index=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    recent_events = load_recent_all_user_study_events(limit=20)
+    if not recent_events.empty:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown("### 最近のテスト・学習履歴")
+        ev = recent_events.copy()
+        ev["score_rate"] = pd.to_numeric(ev["score_rate"], errors="coerce").fillna(0).round(1)
+        ev = ev.rename(columns={
+            "display_user": "ユーザー",
+            "area": "分野",
+            "event_type": "種類",
+            "title": "内容",
+            "total_count": "問題数",
+            "completed_count": "正解/完了",
+            "score_rate": "正解率%",
+            "created_at": "日時",
+        })
+        st.dataframe(ev[["ユーザー", "分野", "種類", "内容", "問題数", "正解/完了", "正解率%", "日時"]], use_container_width=True, hide_index=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+
+def render_my_study_overview():
+    """Overviewの一番上に、ログイン中ユーザー本人の進捗を表示します。"""
+    user_email = st.session_state.get("auth_email", "")
+    st.subheader("👤 自分の学習状況")
+
+    progress_df = load_study_progress()
+    events_df = load_study_events(limit=50)
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown(f"### ログイン中: {html.escape(str(user_email))}", unsafe_allow_html=True)
+
+    if progress_df.empty:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("全体進捗", "0.0%")
+        c2.metric("記録項目", 0)
+        c3.metric("完了/正解", 0)
+        c4.metric("最終学習", "-")
+        st.info("まだ自分の学習記録がありません。パス単・パス単テスト・special-lessonを使うと、ここに自動で表示されます。")
+    else:
+        progress_df = progress_df.copy()
+        progress_df["score_rate"] = pd.to_numeric(progress_df["score_rate"], errors="coerce").fillna(0.0)
+        progress_df["total_count"] = pd.to_numeric(progress_df["total_count"], errors="coerce").fillna(0).astype(int)
+        progress_df["completed_count"] = pd.to_numeric(progress_df["completed_count"], errors="coerce").fillna(0).astype(int)
+
+        total_items = int(progress_df["total_count"].sum())
+        completed_items = int(progress_df["completed_count"].sum())
+        overall_rate = percent_value(completed_items, total_items)
+        latest_updated = str(progress_df["updated_at"].max()) if "updated_at" in progress_df.columns else ""
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("自分の全体進捗", f"{overall_rate:.1f}%")
+        c2.metric("記録項目", len(progress_df))
+        c3.metric("完了/正解", f"{completed_items} / {total_items}")
+        c4.metric("最終学習", latest_updated[:10] if latest_updated else "-")
+
+        st.markdown("#### 最近勉強した場所")
+        latest = progress_df.sort_values("updated_at", ascending=False).head(4)
+        for _, row in latest.iterrows():
+            rate = float(row.get("score_rate") or 0)
+            st.progress(min(1.0, max(0.0, rate / 100)))
+            st.write(
+                f"**{row.get('title','')}**  —  "
+                f"{int(row.get('completed_count') or 0)} / {int(row.get('total_count') or 0)} "
+                f"（{rate:.1f}%） / {row.get('status','')} / 更新: {str(row.get('updated_at',''))[:19]}"
+            )
+
+        area_summary = progress_df.groupby("area", as_index=False).agg(
+            total_count=("total_count", "sum"),
+            completed_count=("completed_count", "sum"),
+            records=("item_key", "count"),
+        )
+        area_summary["進捗率%"] = area_summary.apply(lambda r: percent_value(r["completed_count"], r["total_count"]), axis=1).round(1)
+        area_summary = area_summary.rename(columns={
+            "area": "分野",
+            "total_count": "合計",
+            "completed_count": "完了/正解",
+            "records": "記録数",
+        })
+        st.markdown("#### 分野別の自分の進捗")
+        st.dataframe(area_summary[["分野", "進捗率%", "完了/正解", "合計", "記録数"]], use_container_width=True, hide_index=True)
+
+    # 前回の場所は、学習記録がまだ無い場合でも表示します。
+    app_progress = load_user_progress("app", {})
+    passitan_progress = load_user_progress("passitan", {})
+    passitan_test_progress = load_user_progress("passitan_test", {})
+    special_progress = load_user_progress("special_lesson", {})
+
+    st.markdown("#### 前回の学習場所")
+    last_rows = []
+    if app_progress.get("last_page"):
+        last_rows.append({"項目": "前回開いた画面", "内容": app_progress.get("last_page", "")})
+    if passitan_progress:
+        last_rows.append({
+            "項目": "パス単",
+            "内容": f"{passitan_progress.get('selected_grade','')} / {passitan_progress.get('section_label') or passitan_progress.get('start_no','')} / {passitan_progress.get('view_mode','')}",
+        })
+    if passitan_test_progress:
+        last_rows.append({
+            "項目": "パス単テスト",
+            "内容": f"{passitan_test_progress.get('selected_grade','')} / {passitan_test_progress.get('scope_label','')} / {passitan_test_progress.get('selected_count','')}",
+        })
+    if special_progress:
+        last_rows.append({
+            "項目": "special-lesson",
+            "内容": f"Unit: {special_progress.get('selected_unit','')} / Type: {special_progress.get('selected_qtype','')} / {special_progress.get('count_label','')}",
+        })
+
+    if last_rows:
+        st.dataframe(pd.DataFrame(last_rows), use_container_width=True, hide_index=True)
+    else:
+        st.caption("前回の場所はまだ保存されていません。")
+
+    if not events_df.empty:
+        ev = events_df.copy()
+        ev["score_rate"] = pd.to_numeric(ev["score_rate"], errors="coerce").fillna(0).round(1)
+        ev = ev.rename(columns={
+            "area": "分野",
+            "event_type": "種類",
+            "title": "内容",
+            "total_count": "問題数",
+            "completed_count": "正解/完了",
+            "score_rate": "正解率%",
+            "created_at": "日時",
+        })
+        st.markdown("#### 自分の最近のテスト履歴")
+        st.dataframe(ev[["分野", "種類", "内容", "問題数", "正解/完了", "正解率%", "日時"]].head(10), use_container_width=True, hide_index=True)
+
+    st.markdown('</div>', unsafe_allow_html=True)
 
 
 def auth_page():
@@ -315,6 +857,58 @@ def init_db():
         """
     )
 
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_progress (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            area TEXT NOT NULL,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, area)
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_study_progress (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            area TEXT NOT NULL,
+            item_key TEXT NOT NULL,
+            title TEXT NOT NULL,
+            unit TEXT DEFAULT '',
+            section_no TEXT DEFAULT '',
+            total_count INTEGER DEFAULT 0,
+            completed_count INTEGER DEFAULT 0,
+            score_rate REAL DEFAULT 0,
+            status TEXT DEFAULT '学習中',
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, area, item_key)
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_study_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            area TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            total_count INTEGER DEFAULT 0,
+            completed_count INTEGER DEFAULT 0,
+            score_rate REAL DEFAULT 0,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
     # app.py と同じフォルダに CSV がある場合、パス単データを自動取り込みします。
     csv_path = APP_DIR / "eiken_jun1_passitan_wordlist_enriched.csv"
     if csv_path.exists():
@@ -381,6 +975,70 @@ def load_questions():
     df["session"] = df["session"].astype(str).str.strip()
     df["exam"] = df["year"] + "-" + df["session"]
     return df
+
+
+
+def load_special_lesson_questions():
+    """special_lesson.db から special-lesson 用の問題を読み込みます。"""
+    db_path = next((p for p in SPECIAL_LESSON_DB_CANDIDATES if p.exists()), None)
+    if db_path is None:
+        names = " / ".join(p.name for p in SPECIAL_LESSON_DB_CANDIDATES[:2])
+        return pd.DataFrame(), f"DBが見つかりません: {names} のどちらかを app.py と同じフォルダに置いてください。"
+
+    try:
+        con = sqlite3.connect(db_path, check_same_thread=False)
+        cur = con.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='questions'")
+        if cur.fetchone() is None:
+            con.close()
+            return pd.DataFrame(), f"special-lesson DBに questions テーブルがありません: {db_path.name}"
+
+        cur.execute("PRAGMA table_info(questions)")
+        existing_cols = {row[1] for row in cur.fetchall()}
+        required_cols = ["unit", "qtype", "no", "question", "options", "answer", "jp_translation", "explanation"]
+        missing = [c for c in required_cols if c not in existing_cols]
+        if missing:
+            con.close()
+            return pd.DataFrame(), f"special-lesson DBのquestionsテーブルに必要な列がありません: {', '.join(missing)}"
+
+        df = pd.read_sql_query(
+            """
+            SELECT unit, qtype, no, question, options, answer, jp_translation, explanation
+            FROM questions
+            ORDER BY unit, qtype, no
+            """,
+            con,
+        )
+        con.close()
+    except Exception as e:
+        return pd.DataFrame(), f"special-lesson DBの読み込みに失敗しました: {e}"
+
+    if df.empty:
+        return df, "問題データがありません。"
+
+    for col in ["unit", "qtype", "question", "options", "answer", "jp_translation", "explanation"]:
+        if col in df.columns:
+            df[col] = df[col].fillna("").astype(str)
+    df["no"] = pd.to_numeric(df["no"], errors="coerce").fillna(0).astype(int)
+    return df, ""
+
+
+def parse_special_options(options_text):
+    """DBのoptions列(JSON文字列)を選択肢リストへ変換します。"""
+    options_text = str(options_text or "").strip()
+    if not options_text:
+        return []
+    try:
+        parsed = json.loads(options_text)
+        if isinstance(parsed, list):
+            return [str(x) for x in parsed]
+    except Exception:
+        pass
+    return [x.strip() for x in options_text.split("|") if x.strip()]
+
+
+def normalize_special_answer(value):
+    return " ".join(str(value or "").strip().lower().split())
 
 
 
@@ -920,7 +1578,7 @@ def render_hero(df):
         """
         <div class="hero">
           <span class="pill">Eiken Grade Pre-1</span><span class="pill">Vocabulary DB</span><span class="pill">Translation + Choice Analysis</span>
-          <h1>英検準1級 語彙ダッシュボード</h1>
+          <h1>Learning Engish Dashbord</h1>
           <p>過去問題の文章・日本語訳・選択肢解析・類義語を一元管理し、ダッシュボードから問題を追加できます。</p>
         </div>
         """,
@@ -942,9 +1600,14 @@ def sidebar_filters(df):
             st.rerun()
     st.sidebar.divider()
 
+    page_options = ["🏠 Overview", "📚 試験問題", "🧠 Quiz", "📗 パス単", "🧪 パス単テスト", "🌟 special-lesson", "📈 学習記録", "📝 単語帳", "📄 PDF生成", "➕ 問題を追加", "🛠 データ管理"]
+    app_progress = load_user_progress("app", {})
+    set_session_default_from_progress("main_page_select", app_progress.get("last_page"), page_options)
+
     page = st.sidebar.radio(
         "画面",
-        ["🏠 Overview", "📚 試験問題", "🧠 Quiz", "📗 パス単", "🧪 パス単テスト", "📝 単語帳", "📄 PDF生成", "➕ 問題を追加", "🛠 データ管理"],
+        page_options,
+        key="main_page_select",
         label_visibility="collapsed",
     )
 
@@ -1070,8 +1733,104 @@ def render_card(row, show_answer=True):
     st.markdown('</div>', unsafe_allow_html=True)
 
 
+
+def render_my_study_overview_visible():
+    """Overviewに必ず表示する本人用サマリー。前回修正が見えない環境でも分かるように、overview()内から直接呼びます。"""
+    st.markdown("## 👤 自分の学習状況（Overview）")
+    user_email = st.session_state.get("auth_email", "")
+    progress_df = pd.DataFrame()
+    events_df = pd.DataFrame()
+    try:
+        progress_df = load_study_progress()
+    except Exception as e:
+        st.warning(f"自分の学習記録を読み込めませんでした: {e}")
+    try:
+        events_df = load_study_events(limit=10)
+    except Exception:
+        events_df = pd.DataFrame()
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown(f"**ログイン中:** {html.escape(str(user_email))}", unsafe_allow_html=True)
+
+    if progress_df.empty:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("自分の全体進捗", "0.0%")
+        c2.metric("記録項目", 0)
+        c3.metric("完了/正解", "0 / 0")
+        c4.metric("最終学習", "-")
+        st.info("まだ自分の学習記録がありません。パス単・パス単テスト・special-lessonを使うと、ここに自動で表示されます。")
+    else:
+        dfp = progress_df.copy()
+        dfp["total_count"] = pd.to_numeric(dfp["total_count"], errors="coerce").fillna(0).astype(int)
+        dfp["completed_count"] = pd.to_numeric(dfp["completed_count"], errors="coerce").fillna(0).astype(int)
+        dfp["score_rate"] = pd.to_numeric(dfp["score_rate"], errors="coerce").fillna(0.0)
+        total_count = int(dfp["total_count"].sum())
+        completed_count = int(dfp["completed_count"].sum())
+        overall = percent_value(completed_count, total_count)
+        last_day = str(dfp["updated_at"].max())[:10] if "updated_at" in dfp.columns else "-"
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("自分の全体進捗", f"{overall:.1f}%")
+        c2.metric("記録項目", len(dfp))
+        c3.metric("完了/正解", f"{completed_count} / {total_count}")
+        c4.metric("最終学習", last_day or "-")
+
+        st.markdown("### 最近勉強した内容")
+        for _, row in dfp.sort_values("updated_at", ascending=False).head(5).iterrows():
+            rate = float(row.get("score_rate") or 0)
+            st.progress(min(1.0, max(0.0, rate / 100)))
+            st.write(
+                f"**{row.get('title', '')}**  "
+                f"{int(row.get('completed_count') or 0)} / {int(row.get('total_count') or 0)} "
+                f"（{rate:.1f}%） / {row.get('status', '')}"
+            )
+
+        area_df = dfp.groupby("area", as_index=False).agg(
+            total_count=("total_count", "sum"),
+            completed_count=("completed_count", "sum"),
+            records=("item_key", "count"),
+        )
+        area_df["進捗率%"] = area_df.apply(lambda r: percent_value(r["completed_count"], r["total_count"]), axis=1).round(1)
+        area_df = area_df.rename(columns={"area": "分野", "total_count": "合計", "completed_count": "完了/正解", "records": "記録数"})
+        st.markdown("### 分野別の自分の進捗")
+        st.dataframe(area_df[["分野", "進捗率%", "完了/正解", "合計", "記録数"]], use_container_width=True, hide_index=True)
+
+    st.markdown("### 前回の学習場所")
+    last_rows = []
+    try:
+        app_progress = load_user_progress("app", {})
+        passitan_progress = load_user_progress("passitan", {})
+        passitan_test_progress = load_user_progress("passitan_test", {})
+        special_progress = load_user_progress("special_lesson", {})
+        if app_progress.get("last_page"):
+            last_rows.append({"項目": "前回開いた画面", "内容": app_progress.get("last_page", "")})
+        if passitan_progress:
+            last_rows.append({"項目": "パス単", "内容": f"{passitan_progress.get('selected_grade','')} / {passitan_progress.get('section_label') or passitan_progress.get('start_no','')} / {passitan_progress.get('view_mode','')}"})
+        if passitan_test_progress:
+            last_rows.append({"項目": "パス単テスト", "内容": f"{passitan_test_progress.get('selected_grade','')} / {passitan_test_progress.get('scope_label','')} / {passitan_test_progress.get('selected_count','')}"})
+        if special_progress:
+            last_rows.append({"項目": "special-lesson", "内容": f"Unit: {special_progress.get('selected_unit','')} / Type: {special_progress.get('selected_qtype','')} / {special_progress.get('count_label','')}"})
+    except Exception:
+        last_rows = []
+    if last_rows:
+        st.dataframe(pd.DataFrame(last_rows), use_container_width=True, hide_index=True)
+    else:
+        st.caption("前回の場所はまだ保存されていません。")
+
+    if not events_df.empty:
+        ev = events_df.copy()
+        ev["score_rate"] = pd.to_numeric(ev["score_rate"], errors="coerce").fillna(0).round(1)
+        ev = ev.rename(columns={"area": "分野", "event_type": "種類", "title": "内容", "total_count": "問題数", "completed_count": "正解/完了", "score_rate": "正解率%", "created_at": "日時"})
+        st.markdown("### 自分の最近のテスト履歴")
+        st.dataframe(ev[["分野", "種類", "内容", "問題数", "正解/完了", "正解率%", "日時"]].head(10), use_container_width=True, hide_index=True)
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
 def overview(df):
     render_hero(df)
+    render_my_study_overview_visible()
+    render_all_user_ranking_overview()
     st.subheader("📊 収録データ")
     col1, col2 = st.columns([1.1, 1])
     with col1:
@@ -1083,11 +1842,14 @@ def overview(df):
         st.write("1. 試験問題で文章・訳・選択肢を確認")
         st.write("2. Quizで答えを選ぶ")
         st.write("3. 類義語をまとめて覚える")
-        st.write("4. 新しい問題は『問題を追加』から登録")
+        st.write("4. パス単・テスト・special-lessonの学習記録はOverviewと学習記録に自動表示")
         st.markdown('</div>', unsafe_allow_html=True)
     st.subheader("🔥 最近の重要語")
-    sample = df[["exam", "qno", "correct_word", "synonyms"]].tail(12).sort_values(["exam", "qno"])
-    st.dataframe(sample, use_container_width=True, hide_index=True)
+    if df.empty:
+        st.info("問題データがありません。")
+    else:
+        sample = df[["exam", "qno", "correct_word", "synonyms"]].tail(12).sort_values(["exam", "qno"])
+        st.dataframe(sample, use_container_width=True, hide_index=True)
 
 
 def list_page(df, submenu="Vocabulary"):
@@ -1484,8 +2246,12 @@ def passitan_page():
     existing_labels = passitan_all_df["grade_label"].dropna().astype(str).unique().tolist()
     grade_options = [x for x in preferred if x in existing_labels] + [x for x in existing_labels if x not in preferred]
 
+    progress = load_user_progress("passitan", {})
+    set_session_default_from_progress("passitan_grade_select", progress.get("selected_grade"), grade_options)
+
     st.markdown('<div class="card">', unsafe_allow_html=True)
     selected_grade = st.selectbox("教材を選択", grade_options, index=0, key="passitan_grade_select")
+    st.caption("前回の教材・Section・開始No・表示形式を自動で復元します。")
     st.markdown('</div>', unsafe_allow_html=True)
 
     passitan_df = passitan_all_df[passitan_all_df["grade_label"] == selected_grade].copy()
@@ -1515,12 +2281,28 @@ def passitan_page():
     display_n = 100 if is_pre1_passitan else 50
     section_key = f"passitan_section_{grade_slug}"
     start_key = f"passitan_start_no_{grade_slug}"
+    display_n_key = f"display_n_{grade_slug}"
+    keyword_key = f"passitan_keyword_{grade_slug}"
+    hide_known_key = f"hide_known_{grade_slug}"
+    view_mode_key = f"view_mode_{grade_slug}"
+
+    set_session_default_from_progress(display_n_key, progress.get("display_n"), [10, 20, 50])
+    set_session_default_from_progress(keyword_key, progress.get("keyword"))
+    set_session_default_from_progress(hide_known_key, progress.get("hide_known"), [True, False])
+    set_session_default_from_progress(view_mode_key, progress.get("view_mode"), ["スマホカード", "PC表"])
+    try:
+        saved_start_no = int(progress.get("start_no"))
+    except Exception:
+        saved_start_no = None
+    if saved_start_no is not None:
+        set_session_default_from_progress(start_key, saved_start_no)
 
     if is_pre1_passitan:
         sections = build_passitan_sections(max_passitan_no, section_size=100, fixed_count=19)
+        valid_section_labels = [sec["label"] for sec in sections]
+        set_session_default_from_progress(section_key, progress.get("section_label"), valid_section_labels)
         if section_key not in st.session_state:
             st.session_state[section_key] = sections[0]["label"]
-        valid_section_labels = [sec["label"] for sec in sections]
         if st.session_state[section_key] not in valid_section_labels:
             st.session_state[section_key] = valid_section_labels[0]
 
@@ -1535,23 +2317,23 @@ def passitan_page():
         start_no = int(selected_section["start"])
         end_no = int(selected_section["end"])
         with col_b:
-            keyword = st.text_input("検索", placeholder="例: affect / 影響", key=f"passitan_keyword_{grade_slug}")
+            keyword = st.text_input("検索", placeholder="例: affect / 影響", key=keyword_key)
         with col_c:
-            hide_known = st.checkbox("わかった単語を隠す", value=False, key=f"hide_known_{grade_slug}")
+            hide_known = st.checkbox("わかった単語を隠す", value=False, key=hide_known_key)
         with col_d:
             view_mode = st.radio(
                 "表示形式",
                 ["スマホカード", "PC表"],
                 index=0,
                 horizontal=False,
-                key=f"view_mode_{grade_slug}",
+                key=view_mode_key,
                 help="携帯電話では『スマホカード』を使うと表崩れを防げます。",
             )
         st.info(f"{selected_section_label} を表示します。範囲: No.{start_no}〜No.{end_no}（100語）")
     else:
         col_a, col_b, col_c, col_d, col_e = st.columns([1, 1, 2, 1, 1.2])
         with col_a:
-            display_n = st.selectbox("表示件数", [10, 20, 50], index=2, key=f"display_n_{grade_slug}")
+            display_n = st.selectbox("表示件数", [10, 20, 50], index=2, key=display_n_key)
         with col_b:
             if start_key not in st.session_state:
                 st.session_state[start_key] = 1
@@ -1567,18 +2349,28 @@ def passitan_page():
                 key=start_key,
             )
         with col_c:
-            keyword = st.text_input("検索", placeholder="例: affect / 影響", key=f"passitan_keyword_{grade_slug}")
+            keyword = st.text_input("検索", placeholder="例: affect / 影響", key=keyword_key)
         with col_d:
-            hide_known = st.checkbox("わかった単語を隠す", value=False, key=f"hide_known_{grade_slug}")
+            hide_known = st.checkbox("わかった単語を隠す", value=False, key=hide_known_key)
         with col_e:
             view_mode = st.radio(
                 "表示形式",
                 ["スマホカード", "PC表"],
                 index=0,
                 horizontal=False,
-                key=f"view_mode_{grade_slug}",
+                key=view_mode_key,
                 help="携帯電話では『スマホカード』を使うと表崩れを防げます。",
             )
+    save_user_progress("passitan", {
+        "selected_grade": selected_grade,
+        "section_label": selected_section_label if is_pre1_passitan else "",
+        "start_no": int(start_no),
+        "end_no": int(end_no),
+        "display_n": int(display_n) if not is_pre1_passitan else 100,
+        "keyword": keyword,
+        "hide_known": bool(hide_known),
+        "view_mode": view_mode,
+    })
     st.markdown('</div>', unsafe_allow_html=True)
 
     view = passitan_df.copy()
@@ -1598,6 +2390,22 @@ def passitan_page():
     view = view.sort_values("display_no")
     if not is_pre1_passitan:
         view = view.head(display_n)
+
+    # 現在表示中の範囲を学習記録に保存します。
+    range_total = int(len(view))
+    range_known = int(view["known"].fillna(0).astype(int).sum()) if not view.empty else 0
+    progress_title = f"{selected_grade} {selected_section_label if is_pre1_passitan else f'No.{int(start_no)}〜'}"
+    save_study_progress(
+        area="パス単",
+        item_key=f"{selected_grade}_{int(start_no)}_{int(end_no) if is_pre1_passitan else int(start_no) + int(display_n) - 1}",
+        title=progress_title,
+        unit=selected_grade,
+        section_no=selected_section_label if is_pre1_passitan else str(start_no),
+        total_count=range_total,
+        completed_count=range_known,
+        status="完了" if range_total and range_known >= range_total else "学習中",
+        payload={"start_no": int(start_no), "end_no": int(end_no) if is_pre1_passitan else int(start_no) + int(display_n) - 1},
+    )
 
     st.download_button(
         f"{selected_grade} CSVをダウンロード",
@@ -1973,6 +2781,41 @@ def build_passitan_test_scope_options(passitan_df, selected_grade):
     return options
 
 
+
+
+def play_well_done_voice(text="Well Done!!"):
+    """ブラウザ標準の Web Speech API で Well Done!! を自動読み上げします。"""
+    text_js = json.dumps(str(text or "Well Done!!"), ensure_ascii=False)
+    components.html(
+        f"""
+        <script>
+        (function() {{
+            const text = {text_js};
+            if (!("speechSynthesis" in window)) return;
+            window.speechSynthesis.cancel();
+            const u = new SpeechSynthesisUtterance(text);
+            u.lang = "en-US";
+            u.rate = 0.85;
+            u.pitch = 1.15;
+            u.volume = 1.0;
+            const setVoiceAndSpeak = function() {{
+                const voices = window.speechSynthesis.getVoices();
+                const enVoice = voices.find(v => v.lang === "en-US") || voices.find(v => v.lang && v.lang.startsWith("en"));
+                if (enVoice) u.voice = enVoice;
+                window.speechSynthesis.speak(u);
+            }};
+            if (window.speechSynthesis.getVoices().length === 0) {{
+                window.speechSynthesis.onvoiceschanged = setVoiceAndSpeak;
+                setTimeout(setVoiceAndSpeak, 300);
+            }} else {{
+                setVoiceAndSpeak();
+            }}
+        }})();
+        </script>
+        """,
+        height=0,
+    )
+
 def passitan_test_page():
     st.subheader("🧪 パス単テスト")
     st.caption("日本語の意味を非表示にして、音声または例文ヒントを使いながら、頭文字2文字以外の残りをタイピングします。最後にまとめてチェックできます。")
@@ -1990,7 +2833,11 @@ def passitan_test_page():
     existing_labels = passitan_all_df["grade_label"].dropna().astype(str).unique().tolist()
     grade_options = [x for x in preferred if x in existing_labels] + [x for x in existing_labels if x not in preferred]
 
+    progress = load_user_progress("passitan_test", {})
+    set_session_default_from_progress("passitan_test_grade", progress.get("selected_grade"), grade_options)
+
     st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.caption("前回の教材・出題範囲・出題数・順番を自動で復元します。")
     c_grade, c_scope, c_count, c_mode = st.columns([1.2, 2.0, 1.2, 1.2])
     with c_grade:
         selected_grade = st.selectbox("教材を選択", grade_options, index=0, key="passitan_test_grade")
@@ -2003,8 +2850,21 @@ def passitan_test_page():
 
     scope_options = build_passitan_test_scope_options(passitan_df, selected_grade)
     scope_labels = [opt["label"] for opt in scope_options]
+    grade_slug = passitan_key_slug(selected_grade)
+    scope_key = f"passitan_test_scope_{grade_slug}"
+    count_key = f"passitan_test_count_{grade_slug}"
+    order_key = f"passitan_test_order_{grade_slug}"
+    audio_key = f"passitan_test_audio_{grade_slug}"
+    hint_key = f"passitan_test_hint_{grade_slug}"
+    hide_known_key = f"passitan_test_hide_known_{grade_slug}"
+    set_session_default_from_progress(scope_key, progress.get("scope_label"), scope_labels)
+    set_session_default_from_progress(count_key, progress.get("selected_count"), ["10問", "20問", "50問", "100問", "選択範囲すべて"])
+    set_session_default_from_progress(order_key, progress.get("order_mode"), ["順番通り", "シャッフル"])
+    set_session_default_from_progress(audio_key, progress.get("show_audio"), [True, False])
+    set_session_default_from_progress(hint_key, progress.get("show_example_hint"), [True, False])
+    set_session_default_from_progress(hide_known_key, progress.get("hide_known"), [True, False])
     with c_scope:
-        selected_scope_label = st.selectbox("出題範囲", scope_labels, index=1 if len(scope_labels) > 1 else 0, key=f"passitan_test_scope_{passitan_key_slug(selected_grade)}")
+        selected_scope_label = st.selectbox("出題範囲", scope_labels, index=1 if len(scope_labels) > 1 else 0, key=scope_key)
     selected_scope = next(opt for opt in scope_options if opt["label"] == selected_scope_label)
 
     scoped_df = passitan_df[
@@ -2014,17 +2874,26 @@ def passitan_test_page():
 
     with c_count:
         count_options = ["10問", "20問", "50問", "100問", "選択範囲すべて"]
-        selected_count = st.selectbox("出題数", count_options, index=1, key=f"passitan_test_count_{passitan_key_slug(selected_grade)}")
+        selected_count = st.selectbox("出題数", count_options, index=1, key=count_key)
     with c_mode:
-        order_mode = st.radio("順番", ["順番通り", "シャッフル"], index=0, key=f"passitan_test_order_{passitan_key_slug(selected_grade)}")
+        order_mode = st.radio("順番", ["順番通り", "シャッフル"], index=0, key=order_key)
 
     c_audio, c_hint, c_known = st.columns([1, 1.2, 1.2])
     with c_audio:
-        show_audio = st.checkbox("音声ボタンを表示", value=True, key=f"passitan_test_audio_{passitan_key_slug(selected_grade)}")
+        show_audio = st.checkbox("音声ボタンを表示", value=True, key=audio_key)
     with c_hint:
-        show_example_hint = st.checkbox("例文ヒントを表示（日本語なし）", value=True, key=f"passitan_test_hint_{passitan_key_slug(selected_grade)}")
+        show_example_hint = st.checkbox("例文ヒントを表示（日本語なし）", value=True, key=hint_key)
     with c_known:
-        hide_known = st.checkbox("Knownを除外", value=False, key=f"passitan_test_hide_known_{passitan_key_slug(selected_grade)}")
+        hide_known = st.checkbox("Knownを除外", value=False, key=hide_known_key)
+    save_user_progress("passitan_test", {
+        "selected_grade": selected_grade,
+        "scope_label": selected_scope_label,
+        "selected_count": selected_count,
+        "order_mode": order_mode,
+        "show_audio": bool(show_audio),
+        "show_example_hint": bool(show_example_hint),
+        "hide_known": bool(hide_known),
+    })
     st.markdown('</div>', unsafe_allow_html=True)
 
     if hide_known:
@@ -2171,12 +3040,37 @@ def passitan_test_page():
             })
 
         score_rate = correct_count / max(1, len(result_rows)) * 100
+        save_study_progress(
+            area="パス単テスト",
+            item_key=f"{selected_grade}_{selected_scope_label}",
+            title=f"{selected_grade} / {selected_scope_label}",
+            unit=selected_grade,
+            section_no=selected_scope_label,
+            total_count=len(result_rows),
+            completed_count=correct_count,
+            score_rate=score_rate,
+            status="合格" if score_rate >= 80 else "復習必要",
+            payload={"order_mode": order_mode, "selected_count": selected_count},
+        )
+        add_study_event(
+            area="パス単テスト",
+            event_type="check",
+            title=f"{selected_grade} / {selected_scope_label}",
+            total_count=len(result_rows),
+            completed_count=correct_count,
+            score_rate=score_rate,
+            payload={"selected_count": selected_count},
+        )
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown(f"### 結果: {correct_count} / {len(result_rows)} 問正解（{score_rate:.1f}%）")
         if correct_count == len(result_rows):
-            st.success("全問正解です！")
+            st.balloons()
+            play_well_done_voice("Well Done!!")
+            st.success("全問正解です！ Well Done!!")
         elif score_rate >= 80:
-            st.success("かなり良いです。間違えた単語だけ復習しましょう。")
+            st.balloons()
+            play_well_done_voice("Well Done!!")
+            st.success("かなり良いです。80%以上正解です。Well Done!! 間違えた単語だけ復習しましょう。")
         else:
             st.warning("間違えた単語を確認して、もう一度テストしましょう。")
         st.dataframe(pd.DataFrame(result_rows), use_container_width=True, hide_index=True)
@@ -2223,6 +3117,334 @@ def add_page():
                     st.error("同じ Year / Session / Grade / Q No. がすでに存在します。")
 
 
+
+def special_lesson_page():
+    st.subheader("🌟 special-lesson")
+    st.caption("english_exercises_answers_jp.db の questions テーブルから、穴埋め・文法・語形変化の問題を作成します。各問題ごとに Confirm を押すと、翻訳と解説を表示します。")
+
+    lesson_df, err = load_special_lesson_questions()
+    if err:
+        st.warning(err)
+    if lesson_df.empty:
+        return
+
+    progress = load_user_progress("special_lesson", {})
+    unit_options = ["すべて"] + sorted(lesson_df["unit"].dropna().unique().tolist())
+    qtype_options = ["すべて"] + sorted(lesson_df["qtype"].dropna().unique().tolist())
+    count_options = ["5問", "10問", "20問", "すべて"]
+    order_options = ["順番通り", "シャッフル"]
+    set_session_default_from_progress("special_lesson_unit", progress.get("selected_unit"), unit_options)
+    set_session_default_from_progress("special_lesson_qtype", progress.get("selected_qtype"), qtype_options)
+    set_session_default_from_progress("special_lesson_count", progress.get("count_label"), count_options)
+    set_session_default_from_progress("special_lesson_order", progress.get("order_mode"), order_options)
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.caption("前回のUnit・問題タイプ・出題数・順番を自動で復元します。")
+    c_unit, c_type, c_count, c_order = st.columns([2.0, 1.3, 1.0, 1.1])
+    with c_unit:
+        selected_unit = st.selectbox("Unit", unit_options, index=0, key="special_lesson_unit")
+    with c_type:
+        selected_qtype = st.selectbox("問題タイプ", qtype_options, index=0, key="special_lesson_qtype")
+    with c_count:
+        count_label = st.selectbox("出題数", count_options, index=1, key="special_lesson_count")
+    with c_order:
+        order_mode = st.radio("順番", order_options, index=0, key="special_lesson_order")
+    save_user_progress("special_lesson", {
+        "selected_unit": selected_unit,
+        "selected_qtype": selected_qtype,
+        "count_label": count_label,
+        "order_mode": order_mode,
+    })
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    view = lesson_df.copy()
+    if selected_unit != "すべて":
+        view = view[view["unit"] == selected_unit]
+    if selected_qtype != "すべて":
+        view = view[view["qtype"] == selected_qtype]
+
+    if view.empty:
+        st.info("この条件で出題できる問題がありません。")
+        return
+
+    if count_label == "すべて":
+        test_n = len(view)
+    else:
+        test_n = min(int(count_label.replace("問", "")), len(view))
+
+    special_key_base = f"special_lesson_{selected_unit}_{selected_qtype}_{test_n}_{order_mode}"
+    if order_mode == "シャッフル":
+        seed_key = f"{special_key_base}_seed"
+        if seed_key not in st.session_state:
+            st.session_state[seed_key] = random.randint(1, 10_000_000)
+        test_df = view.sample(n=test_n, random_state=int(st.session_state[seed_key])).copy()
+    else:
+        test_df = view.head(test_n).copy()
+
+    st.info(f"出題数: {len(test_df)}問 / Unit: {selected_unit} / Type: {selected_qtype}")
+
+    st.markdown(
+        """
+        <style>
+        .special-lesson-card {
+            padding: 14px 16px;
+            border-radius: 18px;
+            background: rgba(255,255,255,.045);
+            border: 1px solid rgba(255,255,255,.18);
+            margin: 0 0 12px 0;
+        }
+        .special-lesson-meta {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 999px;
+            background: rgba(255,255,255,.13);
+            color: #dce8fb;
+            font-size: 12px;
+            font-weight: 850;
+            margin-right: 6px;
+            margin-bottom: 8px;
+        }
+        .special-lesson-question {
+            color: #ffffff;
+            font-size: 22px;
+            line-height: 1.75;
+            font-weight: 800;
+            margin: 8px 0 12px 0;
+        }
+        .special-lesson-feedback {
+            margin-top: 12px;
+            padding: 12px 14px;
+            border-radius: 14px;
+            background: rgba(255,255,255,.055);
+            border: 1px solid rgba(255,255,255,.12);
+            color: #dce8fb;
+            line-height: 1.65;
+        }
+        .special-lesson-ok { color: #b7ffcf; font-weight: 850; }
+        .special-lesson-ng { color: #ffb7b7; font-weight: 850; }
+        .special-lesson-label { color: #78c7ff; font-weight: 850; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    answers = {}
+    rows = list(test_df.reset_index(drop=True).iterrows())
+    for idx, (_, row) in enumerate(rows, start=1):
+        unit = str(row.get("unit", ""))
+        qtype = str(row.get("qtype", ""))
+        no = int(row.get("no", 0))
+        question = str(row.get("question", ""))
+        correct_answer = str(row.get("answer", ""))
+        jp_translation = str(row.get("jp_translation", ""))
+        explanation = str(row.get("explanation", ""))
+        options = parse_special_options(row.get("options", ""))
+        answer_key = f"special_answer_{special_key_base}_{idx}_{unit}_{qtype}_{no}"
+        confirm_key = f"special_confirmed_{special_key_base}_{idx}_{unit}_{qtype}_{no}"
+
+        st.markdown('<div class="special-lesson-card">', unsafe_allow_html=True)
+        st.markdown(
+            f'<span class="special-lesson-meta">Q{idx}</span>'
+            f'<span class="special-lesson-meta">{html.escape(unit)}</span>'
+            f'<span class="special-lesson-meta">{html.escape(qtype)}</span>'
+            f'<span class="special-lesson-meta">No.{no}</span>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(f'<div class="special-lesson-question">{html.escape(question)}</div>', unsafe_allow_html=True)
+
+        if options:
+            selected = st.radio(
+                "答えを選んでください",
+                options,
+                index=None,
+                key=answer_key,
+                horizontal=True,
+            )
+            answers[idx] = selected or ""
+        else:
+            answers[idx] = st.text_input(
+                "答えを入力してください",
+                key=answer_key,
+                placeholder="英単語・語形を入力",
+            )
+
+        if st.button("Confirm", key=f"special_confirm_btn_{special_key_base}_{idx}_{unit}_{qtype}_{no}"):
+            st.session_state[confirm_key] = True
+
+        if st.session_state.get(confirm_key):
+            user_answer = str(st.session_state.get(answer_key, "") or "")
+            ok = normalize_special_answer(user_answer) == normalize_special_answer(correct_answer)
+            result_class = "special-lesson-ok" if ok else "special-lesson-ng"
+            result_text = "正解です！" if ok else "不正解です。"
+            st.markdown(
+                f"""
+                <div class="special-lesson-feedback">
+                  <div class="{result_class}">{result_text}</div>
+                  <div><span class="special-lesson-label">あなたの答え:</span> {html.escape(user_answer or "未入力")}</div>
+                  <div><span class="special-lesson-label">正解:</span> {html.escape(correct_answer)}</div>
+                  <div><span class="special-lesson-label">日本語訳:</span> {html.escape(jp_translation)}</div>
+                  <div><span class="special-lesson-label">解説:</span> {html.escape(explanation)}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    c_check, c_shuffle = st.columns([1, 1])
+    with c_check:
+        checked = st.button("✅ 全体の答えをチェック", type="primary", key=f"special_check_{special_key_base}")
+    with c_shuffle:
+        if order_mode == "シャッフル" and st.button("🔄 シャッフルを更新", key=f"special_reshuffle_{special_key_base}"):
+            st.session_state[f"{special_key_base}_seed"] = random.randint(1, 10_000_000)
+            # シャッフル時は表示済みConfirm状態をクリアします。
+            for key in list(st.session_state.keys()):
+                if str(key).startswith(f"special_confirmed_{special_key_base}"):
+                    st.session_state.pop(key, None)
+            st.rerun()
+
+    if checked:
+        result_rows = []
+        correct_count = 0
+        for idx, (_, row) in enumerate(rows, start=1):
+            correct_answer = str(row.get("answer", ""))
+            user_answer = str(answers.get(idx, ""))
+            ok = normalize_special_answer(user_answer) == normalize_special_answer(correct_answer)
+            if ok:
+                correct_count += 1
+            result_rows.append({
+                "No": int(row.get("no", 0)),
+                "Unit": str(row.get("unit", "")),
+                "Type": str(row.get("qtype", "")),
+                "結果": "○" if ok else "×",
+                "入力": user_answer,
+                "正解": correct_answer,
+                "日本語訳": str(row.get("jp_translation", "")),
+                "解説": str(row.get("explanation", "")),
+            })
+
+        score_rate = correct_count / max(1, len(result_rows)) * 100
+        save_study_progress(
+            area="special-lesson",
+            item_key=f"{selected_unit}_{selected_qtype}",
+            title=f"Unit: {selected_unit} / Type: {selected_qtype}",
+            unit=selected_unit,
+            section_no=selected_qtype,
+            total_count=len(result_rows),
+            completed_count=correct_count,
+            score_rate=score_rate,
+            status="合格" if score_rate >= 80 else "復習必要",
+            payload={"count_label": count_label, "order_mode": order_mode},
+        )
+        add_study_event(
+            area="special-lesson",
+            event_type="check",
+            title=f"Unit: {selected_unit} / Type: {selected_qtype}",
+            total_count=len(result_rows),
+            completed_count=correct_count,
+            score_rate=score_rate,
+            payload={"count_label": count_label},
+        )
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown(f"### 結果: {correct_count} / {len(result_rows)} 問正解（{score_rate:.1f}%）")
+        if score_rate >= 80:
+            st.balloons()
+            play_well_done_voice("Well Done!!")
+            st.success("Well Done!! 80%以上正解です。")
+        else:
+            st.warning("間違えた問題を確認して、もう一度練習しましょう。")
+        st.dataframe(pd.DataFrame(result_rows), use_container_width=True, hide_index=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+def study_records_page():
+    st.subheader("📈 学習記録")
+    st.caption("ユーザーごとに、前回どこまで学習したか・進捗率・テスト結果を保存して表示します。")
+
+    progress_df = load_study_progress()
+    events_df = load_study_events(limit=200)
+
+    if progress_df.empty:
+        st.info("まだ学習記録がありません。パス単・パス単テスト・special-lessonを使うと自動で記録されます。")
+        return
+
+    progress_df = progress_df.copy()
+    progress_df["score_rate"] = pd.to_numeric(progress_df["score_rate"], errors="coerce").fillna(0)
+    progress_df["total_count"] = pd.to_numeric(progress_df["total_count"], errors="coerce").fillna(0).astype(int)
+    progress_df["completed_count"] = pd.to_numeric(progress_df["completed_count"], errors="coerce").fillna(0).astype(int)
+
+    total_items = int(progress_df["total_count"].sum())
+    completed_items = int(progress_df["completed_count"].sum())
+    overall_rate = percent_value(completed_items, total_items)
+    latest_updated = str(progress_df["updated_at"].max()) if "updated_at" in progress_df.columns else ""
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("全体進捗", f"{overall_rate:.1f}%")
+    c2.metric("記録項目", len(progress_df))
+    c3.metric("完了/正解", completed_items)
+    c4.metric("最終学習", latest_updated[:10])
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("### 学習中の場所")
+    latest = progress_df.sort_values("updated_at", ascending=False).head(6)
+    for _, row in latest.iterrows():
+        rate = float(row.get("score_rate") or 0)
+        st.progress(min(1.0, max(0.0, rate / 100)))
+        st.write(
+            f"**{row.get('title','')}**  —  {int(row.get('completed_count') or 0)} / {int(row.get('total_count') or 0)} "
+            f"（{rate:.1f}%） / {row.get('status','')} / 更新: {row.get('updated_at','')}"
+        )
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("### 分野別の進捗")
+    area_summary = progress_df.groupby("area", as_index=False).agg(
+        total_count=("total_count", "sum"),
+        completed_count=("completed_count", "sum"),
+        records=("item_key", "count"),
+    )
+    area_summary["進捗率%"] = area_summary.apply(lambda r: percent_value(r["completed_count"], r["total_count"]), axis=1).round(1)
+    st.dataframe(area_summary.rename(columns={"area": "分野", "total_count": "合計", "completed_count": "完了/正解", "records": "記録数"}), use_container_width=True, hide_index=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("### 詳細")
+    detail = progress_df.rename(columns={
+        "area": "分野",
+        "title": "内容",
+        "unit": "教材/Unit",
+        "section_no": "Section/Type",
+        "total_count": "合計",
+        "completed_count": "完了/正解",
+        "score_rate": "進捗率%",
+        "status": "状態",
+        "updated_at": "更新日時",
+    })
+    show_cols = ["分野", "内容", "教材/Unit", "Section/Type", "合計", "完了/正解", "進捗率%", "状態", "更新日時"]
+    st.dataframe(detail[show_cols], use_container_width=True, hide_index=True)
+    st.download_button(
+        "学習記録CSVをダウンロード",
+        detail[show_cols].to_csv(index=False).encode("utf-8-sig"),
+        file_name="study_records.csv",
+        mime="text/csv",
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    if not events_df.empty:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown("### テスト履歴")
+        events_view = events_df.rename(columns={
+            "area": "分野",
+            "event_type": "種類",
+            "title": "内容",
+            "total_count": "問題数",
+            "completed_count": "正解数",
+            "score_rate": "正解率%",
+            "created_at": "日時",
+        })
+        st.dataframe(events_view, use_container_width=True, hide_index=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+
 def data_page(df):
     st.subheader("🛠 データ管理")
     st.write("SQLite DB:", str(DB_PATH))
@@ -2251,6 +3473,7 @@ def main():
 
     df = load_questions()
     page, selected, keyword, question_submenu = sidebar_filters(df)
+    save_user_progress("app", {"last_page": page})
     fdf = apply_filter(df, selected, keyword)
     if page == "🏠 Overview":
         overview(fdf)
@@ -2262,6 +3485,10 @@ def main():
         passitan_page()
     elif page == "🧪 パス単テスト":
         passitan_test_page()
+    elif page == "🌟 special-lesson":
+        special_lesson_page()
+    elif page == "📈 学習記録":
+        study_records_page()
     elif page == "📝 単語帳":
         vocab_page()
     elif page == "📄 PDF生成":
