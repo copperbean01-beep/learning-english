@@ -4,6 +4,7 @@ import random
 import sqlite3
 import hashlib
 import secrets
+from urllib.parse import quote
 from pathlib import Path
 from datetime import date, timedelta
 
@@ -48,6 +49,31 @@ SPECIAL_LESSON_DB_CANDIDATES = [
     Path("/mnt/data/english_exercises_answers_jp.db"),
 ]
 SPECIAL_LESSON_DB_PATH = next((p for p in SPECIAL_LESSON_DB_CANDIDATES if p.exists()), SPECIAL_LESSON_DB_CANDIDATES[0])
+
+# TOEFL-5600 用DB。app.py と同じフォルダの toefl_5600.db を優先し、
+# 開発環境では /mnt/data/toefl_5600.db も読み込みます。
+TOEFL_5600_DB_CANDIDATES = [
+    APP_DIR / "toefl_5600.db",
+    Path("/mnt/data/toefl_5600.db"),
+]
+TOEFL_5600_DB_PATH = next((p for p in TOEFL_5600_DB_CANDIDATES if p.exists()), TOEFL_5600_DB_CANDIDATES[0])
+
+# TOEFL-KMF-word 用DB。CSVから作成した toefl_kmf_words.db を読み込みます。
+TOEFL_KMF_WORD_DB_CANDIDATES = [
+    APP_DIR / "toefl_kmf_words.db",
+    Path("/mnt/data/toefl_kmf_words.db"),
+]
+TOEFL_KMF_WORD_DB_PATH = next((p for p in TOEFL_KMF_WORD_DB_CANDIDATES if p.exists()), TOEFL_KMF_WORD_DB_CANDIDATES[0])
+
+# scientificamerican.com 用DB。日本語翻訳入りの science_articles_bilingual.db を優先し、
+# 旧 scientificamerican.db も互換のため読み込みます。
+SCIENTIFICAMERICAN_DB_CANDIDATES = [
+    APP_DIR / "science_articles_bilingual.db",
+    Path("/mnt/data/science_articles_bilingual.db"),
+    APP_DIR / "scientificamerican.db",
+    Path("/mnt/data/scientificamerican.db"),
+]
+SCIENTIFICAMERICAN_DB_PATH = next((p for p in SCIENTIFICAMERICAN_DB_CANDIDATES if p.exists()), SCIENTIFICAMERICAN_DB_CANDIDATES[0])
 EXPORT_DIR = APP_DIR / "exports"
 
 st.set_page_config(
@@ -84,6 +110,8 @@ html, body, [class*="css"] { font-family: 'Inter', 'Noto Sans JP', sans-serif; }
 }
 .qnum { color:#78c7ff; font-weight:800; letter-spacing:.02em; }
 .question { color:#ffffff; font-size: 22px; line-height: 1.85; font-weight: 700; }
+.choice-line { color:#ffffff; font-size: 22px; line-height: 1.85; font-weight: 700; }
+.choice-line b { font-size: 22px; font-weight: 800; }
 .translation { color:#d3dceb; line-height: 1.75; background: rgba(255,255,255,.055); padding: 14px 16px; border-radius: 16px; margin: 12px 0; }
 .answer { color:#b7ffcf; font-weight:800; }
 .small { color:#aebbd0; font-size: 14px; line-height: 1.65; }
@@ -170,541 +198,13 @@ def logout_user():
         st.session_state.pop(key, None)
 
 
-def current_user_id():
-    """現在ログイン中のユーザーIDを返します。"""
-    try:
-        return int(st.session_state.get("auth_user_id") or 0)
-    except Exception:
-        return 0
-
-
-def load_user_progress(area, default=None):
-    """ユーザーごとの前回学習位置を読み込みます。"""
-    user_id = current_user_id()
-    if not user_id:
-        return default if default is not None else {}
-    con = connect()
-    try:
-        cur = con.cursor()
-        cur.execute(
-            "SELECT payload_json FROM user_progress WHERE user_id=? AND area=?",
-            (user_id, str(area)),
-        )
-        row = cur.fetchone()
-        if not row:
-            return default if default is not None else {}
-        data = json.loads(row[0] or "{}")
-        return data if isinstance(data, dict) else (default if default is not None else {})
-    except Exception:
-        return default if default is not None else {}
-    finally:
-        con.close()
-
-
-def save_user_progress(area, payload):
-    """ユーザーごとの前回学習位置を保存します。"""
-    user_id = current_user_id()
-    if not user_id:
-        return
-    try:
-        payload_json = json.dumps(payload or {}, ensure_ascii=False)
-        con = connect()
-        con.execute(
-            """
-            INSERT INTO user_progress (user_id, area, payload_json)
-            VALUES (?, ?, ?)
-            ON CONFLICT(user_id, area) DO UPDATE SET
-                payload_json=excluded.payload_json,
-                updated_at=CURRENT_TIMESTAMP
-            """,
-            (user_id, str(area), payload_json),
-        )
-        con.commit()
-    except Exception:
-        pass
-    finally:
-        try:
-            con.close()
-        except Exception:
-            pass
-
-
-def set_session_default_from_progress(key, value, valid_values=None):
-    """Streamlit widget作成前に、保存済みの値を初期値として復元します。"""
-    if key in st.session_state or value is None:
-        return
-    if valid_values is not None and value not in valid_values:
-        return
-    st.session_state[key] = value
-
-def percent_value(completed, total):
-    """進捗率を0〜100で返します。"""
-    try:
-        total = int(total or 0)
-        completed = int(completed or 0)
-        if total <= 0:
-            return 0.0
-        return max(0.0, min(100.0, completed / total * 100))
-    except Exception:
-        return 0.0
-
-
-def save_study_progress(area, item_key, title, total_count=0, completed_count=0, unit="", section_no="", score_rate=None, status="学習中", payload=None):
-    """ユーザー別に、どこまで学習したかの最新状態を保存します。"""
-    user_id = current_user_id()
-    if not user_id:
-        return
-    try:
-        total_count = int(total_count or 0)
-        completed_count = int(completed_count or 0)
-        if score_rate is None:
-            score_rate = percent_value(completed_count, total_count)
-        payload_json = json.dumps(payload or {}, ensure_ascii=False)
-        con = connect()
-        con.execute(
-            """
-            INSERT INTO user_study_progress
-            (user_id, area, item_key, title, unit, section_no, total_count, completed_count, score_rate, status, payload_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(user_id, area, item_key) DO UPDATE SET
-                title=excluded.title,
-                unit=excluded.unit,
-                section_no=excluded.section_no,
-                total_count=excluded.total_count,
-                completed_count=excluded.completed_count,
-                score_rate=excluded.score_rate,
-                status=excluded.status,
-                payload_json=excluded.payload_json,
-                updated_at=CURRENT_TIMESTAMP
-            """,
-            (user_id, str(area), str(item_key), str(title), str(unit), str(section_no), total_count, completed_count, float(score_rate or 0), str(status), payload_json),
-        )
-        con.commit()
-    except Exception:
-        pass
-    finally:
-        try:
-            con.close()
-        except Exception:
-            pass
-
-
-def add_study_event(area, event_type, title, total_count=0, completed_count=0, score_rate=None, payload=None):
-    """テスト完了・Confirmなどの学習履歴を時系列で保存します。"""
-    user_id = current_user_id()
-    if not user_id:
-        return
-    try:
-        total_count = int(total_count or 0)
-        completed_count = int(completed_count or 0)
-        if score_rate is None:
-            score_rate = percent_value(completed_count, total_count)
-        payload_json = json.dumps(payload or {}, ensure_ascii=False)
-        con = connect()
-        con.execute(
-            """
-            INSERT INTO user_study_events
-            (user_id, area, event_type, title, total_count, completed_count, score_rate, payload_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (user_id, str(area), str(event_type), str(title), total_count, completed_count, float(score_rate or 0), payload_json),
-        )
-        con.commit()
-    except Exception:
-        pass
-    finally:
-        try:
-            con.close()
-        except Exception:
-            pass
-
-
-def load_study_progress():
-    user_id = current_user_id()
-    if not user_id:
-        return pd.DataFrame()
-    con = connect()
-    try:
-        return pd.read_sql_query(
-            """
-            SELECT area, item_key, title, unit, section_no, total_count, completed_count, score_rate, status, updated_at
-            FROM user_study_progress
-            WHERE user_id=?
-            ORDER BY updated_at DESC
-            """,
-            con,
-            params=(user_id,),
-        )
-    finally:
-        con.close()
-
-
-def load_study_events(limit=200):
-    user_id = current_user_id()
-    if not user_id:
-        return pd.DataFrame()
-    con = connect()
-    try:
-        return pd.read_sql_query(
-            """
-            SELECT area, event_type, title, total_count, completed_count, score_rate, created_at
-            FROM user_study_events
-            WHERE user_id=?
-            ORDER BY created_at DESC
-            LIMIT ?
-            """,
-            con,
-            params=(user_id, int(limit)),
-        )
-    finally:
-        con.close()
-
-def mask_email_for_ranking(email):
-    """ランキング表示用にメールアドレスを短く表示します。"""
-    email = str(email or "").strip()
-    if not email or "@" not in email:
-        return email or "unknown"
-    name, domain = email.split("@", 1)
-    if len(name) <= 2:
-        shown = name[:1] + "*"
-    else:
-        shown = name[:2] + "***"
-    return f"{shown}@{domain}"
-
-
-def load_all_user_progress_ranking():
-    """Overview用：全ユーザーの学習進捗ランキングを取得します。"""
-    con = connect()
-    try:
-        progress = pd.read_sql_query(
-            """
-            SELECT
-                u.id AS user_id,
-                u.email AS email,
-                COUNT(p.id) AS records,
-                COALESCE(SUM(p.total_count), 0) AS total_count,
-                COALESCE(SUM(p.completed_count), 0) AS completed_count,
-                COALESCE(AVG(p.score_rate), 0) AS avg_progress_rate,
-                MAX(p.updated_at) AS last_study_at
-            FROM users u
-            LEFT JOIN user_study_progress p ON p.user_id = u.id
-            GROUP BY u.id, u.email
-            """,
-            con,
-        )
-        events = pd.read_sql_query(
-            """
-            SELECT
-                user_id,
-                COUNT(id) AS test_count,
-                COALESCE(AVG(score_rate), 0) AS avg_test_rate,
-                COALESCE(MAX(score_rate), 0) AS best_test_rate,
-                MAX(created_at) AS last_test_at
-            FROM user_study_events
-            WHERE area IN ('passitan_test', 'special_lesson')
-            GROUP BY user_id
-            """,
-            con,
-        )
-    except Exception:
-        return pd.DataFrame()
-    finally:
-        con.close()
-
-    if progress.empty:
-        return progress
-
-    merged = progress.merge(events, on="user_id", how="left")
-    for col in ["records", "total_count", "completed_count", "test_count"]:
-        merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0).astype(int)
-    for col in ["avg_progress_rate", "avg_test_rate", "best_test_rate"]:
-        merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0.0)
-
-    merged["overall_rate"] = merged.apply(lambda r: percent_value(r["completed_count"], r["total_count"]), axis=1)
-    # 進捗率だけだと少数の学習でも上位になるため、完了数も少し加点します。
-    merged["rank_score"] = merged["overall_rate"] + (merged["completed_count"].clip(upper=500) / 500 * 10) + (merged["avg_test_rate"].fillna(0) * 0.05)
-    merged = merged.sort_values(["rank_score", "completed_count", "records"], ascending=[False, False, False]).reset_index(drop=True)
-    merged["rank"] = merged.index + 1
-    merged["display_user"] = merged["email"].apply(mask_email_for_ranking)
-    return merged
-
-
-def load_all_user_area_progress(area):
-    """Overview用：特定分野の全ユーザー進捗を取得します。"""
-    con = connect()
-    try:
-        df = pd.read_sql_query(
-            """
-            SELECT
-                u.id AS user_id,
-                u.email AS email,
-                COUNT(p.id) AS records,
-                COALESCE(SUM(p.total_count), 0) AS total_count,
-                COALESCE(SUM(p.completed_count), 0) AS completed_count,
-                COALESCE(AVG(p.score_rate), 0) AS avg_rate,
-                MAX(p.updated_at) AS last_study_at
-            FROM users u
-            JOIN user_study_progress p ON p.user_id = u.id
-            WHERE p.area=?
-            GROUP BY u.id, u.email
-            """,
-            con,
-            params=(str(area),),
-        )
-    except Exception:
-        return pd.DataFrame()
-    finally:
-        con.close()
-
-    if df.empty:
-        return df
-    for col in ["records", "total_count", "completed_count"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
-    df["progress_rate"] = df.apply(lambda r: percent_value(r["completed_count"], r["total_count"]), axis=1)
-    df["display_user"] = df["email"].apply(mask_email_for_ranking)
-    df = df.sort_values(["progress_rate", "completed_count"], ascending=[False, False]).reset_index(drop=True)
-    df["rank"] = df.index + 1
-    return df
-
-
-def load_recent_all_user_study_events(limit=20):
-    """Overview用：全ユーザーの最近のテスト履歴を取得します。"""
-    con = connect()
-    try:
-        df = pd.read_sql_query(
-            """
-            SELECT
-                u.email AS email,
-                e.area,
-                e.event_type,
-                e.title,
-                e.total_count,
-                e.completed_count,
-                e.score_rate,
-                e.created_at
-            FROM user_study_events e
-            JOIN users u ON u.id = e.user_id
-            ORDER BY e.created_at DESC
-            LIMIT ?
-            """,
-            con,
-            params=(int(limit),),
-        )
-    except Exception:
-        return pd.DataFrame()
-    finally:
-        con.close()
-    if not df.empty:
-        df["display_user"] = df["email"].apply(mask_email_for_ranking)
-    return df
-
-
-def render_all_user_ranking_overview():
-    """Overviewに、全ユーザーの進捗・ランキングを表示します。"""
-    ranking_df = load_all_user_progress_ranking()
-
-    st.subheader("🏆 全ユーザーの勉強進捗・ランキング")
-    if ranking_df.empty:
-        st.info("まだ全ユーザーの学習記録がありません。パス単・パス単テスト・special-lessonを使うと自動で記録されます。")
-        return
-
-    active_df = ranking_df[ranking_df["records"] > 0].copy()
-    active_users = len(active_df)
-    total_users = len(ranking_df)
-    total_completed = int(ranking_df["completed_count"].sum())
-    avg_rate = float(active_df["overall_rate"].mean()) if active_users else 0.0
-
-    my_rank_text = "-"
-    uid = current_user_id()
-    if uid and uid in ranking_df["user_id"].tolist():
-        my_row = ranking_df[ranking_df["user_id"] == uid].iloc[0]
-        my_rank_text = f"{int(my_row['rank'])}位 / {total_users}人"
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("登録ユーザー", total_users)
-    c2.metric("学習記録あり", active_users)
-    c3.metric("全員の完了/正解数", total_completed)
-    c4.metric("自分の順位", my_rank_text)
-
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown("### 総合ランキング")
-    show = ranking_df.copy()
-    show["overall_rate"] = show["overall_rate"].round(1)
-    show["avg_test_rate"] = show["avg_test_rate"].round(1)
-    show["best_test_rate"] = show["best_test_rate"].round(1)
-    show["last_study_at"] = show["last_study_at"].fillna("").astype(str)
-    ranking_view = show.rename(columns={
-        "rank": "順位",
-        "display_user": "ユーザー",
-        "overall_rate": "全体進捗%",
-        "records": "記録項目",
-        "completed_count": "完了/正解",
-        "total_count": "合計",
-        "test_count": "テスト回数",
-        "avg_test_rate": "平均テスト%",
-        "best_test_rate": "最高テスト%",
-        "last_study_at": "最終学習",
-    })
-    cols = ["順位", "ユーザー", "全体進捗%", "記録項目", "完了/正解", "合計", "テスト回数", "平均テスト%", "最高テスト%", "最終学習"]
-    st.dataframe(ranking_view[cols].head(20), use_container_width=True, hide_index=True)
-    st.caption(f"アクティブユーザー平均進捗: {avg_rate:.1f}%")
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    passitan_rank = load_all_user_area_progress("passitan")
-    if not passitan_rank.empty:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("### パス単 学習進捗ランキング")
-        pv = passitan_rank.copy()
-        pv["progress_rate"] = pv["progress_rate"].round(1)
-        pv = pv.rename(columns={
-            "rank": "順位",
-            "display_user": "ユーザー",
-            "progress_rate": "進捗%",
-            "completed_count": "Known/完了",
-            "total_count": "表示/学習数",
-            "records": "記録項目",
-            "last_study_at": "最終学習",
-        })
-        st.dataframe(pv[["順位", "ユーザー", "進捗%", "Known/完了", "表示/学習数", "記録項目", "最終学習"]].head(20), use_container_width=True, hide_index=True)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    recent_events = load_recent_all_user_study_events(limit=20)
-    if not recent_events.empty:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("### 最近のテスト・学習履歴")
-        ev = recent_events.copy()
-        ev["score_rate"] = pd.to_numeric(ev["score_rate"], errors="coerce").fillna(0).round(1)
-        ev = ev.rename(columns={
-            "display_user": "ユーザー",
-            "area": "分野",
-            "event_type": "種類",
-            "title": "内容",
-            "total_count": "問題数",
-            "completed_count": "正解/完了",
-            "score_rate": "正解率%",
-            "created_at": "日時",
-        })
-        st.dataframe(ev[["ユーザー", "分野", "種類", "内容", "問題数", "正解/完了", "正解率%", "日時"]], use_container_width=True, hide_index=True)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-
-def render_my_study_overview():
-    """Overviewの一番上に、ログイン中ユーザー本人の進捗を表示します。"""
-    user_email = st.session_state.get("auth_email", "")
-    st.subheader("👤 自分の学習状況")
-
-    progress_df = load_study_progress()
-    events_df = load_study_events(limit=50)
-
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown(f"### ログイン中: {html.escape(str(user_email))}", unsafe_allow_html=True)
-
-    if progress_df.empty:
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("全体進捗", "0.0%")
-        c2.metric("記録項目", 0)
-        c3.metric("完了/正解", 0)
-        c4.metric("最終学習", "-")
-        st.info("まだ自分の学習記録がありません。パス単・パス単テスト・special-lessonを使うと、ここに自動で表示されます。")
-    else:
-        progress_df = progress_df.copy()
-        progress_df["score_rate"] = pd.to_numeric(progress_df["score_rate"], errors="coerce").fillna(0.0)
-        progress_df["total_count"] = pd.to_numeric(progress_df["total_count"], errors="coerce").fillna(0).astype(int)
-        progress_df["completed_count"] = pd.to_numeric(progress_df["completed_count"], errors="coerce").fillna(0).astype(int)
-
-        total_items = int(progress_df["total_count"].sum())
-        completed_items = int(progress_df["completed_count"].sum())
-        overall_rate = percent_value(completed_items, total_items)
-        latest_updated = str(progress_df["updated_at"].max()) if "updated_at" in progress_df.columns else ""
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("自分の全体進捗", f"{overall_rate:.1f}%")
-        c2.metric("記録項目", len(progress_df))
-        c3.metric("完了/正解", f"{completed_items} / {total_items}")
-        c4.metric("最終学習", latest_updated[:10] if latest_updated else "-")
-
-        st.markdown("#### 最近勉強した場所")
-        latest = progress_df.sort_values("updated_at", ascending=False).head(4)
-        for _, row in latest.iterrows():
-            rate = float(row.get("score_rate") or 0)
-            st.progress(min(1.0, max(0.0, rate / 100)))
-            st.write(
-                f"**{row.get('title','')}**  —  "
-                f"{int(row.get('completed_count') or 0)} / {int(row.get('total_count') or 0)} "
-                f"（{rate:.1f}%） / {row.get('status','')} / 更新: {str(row.get('updated_at',''))[:19]}"
-            )
-
-        area_summary = progress_df.groupby("area", as_index=False).agg(
-            total_count=("total_count", "sum"),
-            completed_count=("completed_count", "sum"),
-            records=("item_key", "count"),
-        )
-        area_summary["進捗率%"] = area_summary.apply(lambda r: percent_value(r["completed_count"], r["total_count"]), axis=1).round(1)
-        area_summary = area_summary.rename(columns={
-            "area": "分野",
-            "total_count": "合計",
-            "completed_count": "完了/正解",
-            "records": "記録数",
-        })
-        st.markdown("#### 分野別の自分の進捗")
-        st.dataframe(area_summary[["分野", "進捗率%", "完了/正解", "合計", "記録数"]], use_container_width=True, hide_index=True)
-
-    # 前回の場所は、学習記録がまだ無い場合でも表示します。
-    app_progress = load_user_progress("app", {})
-    passitan_progress = load_user_progress("passitan", {})
-    passitan_test_progress = load_user_progress("passitan_test", {})
-    special_progress = load_user_progress("special_lesson", {})
-
-    st.markdown("#### 前回の学習場所")
-    last_rows = []
-    if app_progress.get("last_page"):
-        last_rows.append({"項目": "前回開いた画面", "内容": app_progress.get("last_page", "")})
-    if passitan_progress:
-        last_rows.append({
-            "項目": "パス単",
-            "内容": f"{passitan_progress.get('selected_grade','')} / {passitan_progress.get('section_label') or passitan_progress.get('start_no','')} / {passitan_progress.get('view_mode','')}",
-        })
-    if passitan_test_progress:
-        last_rows.append({
-            "項目": "パス単テスト",
-            "内容": f"{passitan_test_progress.get('selected_grade','')} / {passitan_test_progress.get('scope_label','')} / {passitan_test_progress.get('selected_count','')}",
-        })
-    if special_progress:
-        last_rows.append({
-            "項目": "special-lesson",
-            "内容": f"Unit: {special_progress.get('selected_unit','')} / Type: {special_progress.get('selected_qtype','')} / {special_progress.get('count_label','')}",
-        })
-
-    if last_rows:
-        st.dataframe(pd.DataFrame(last_rows), use_container_width=True, hide_index=True)
-    else:
-        st.caption("前回の場所はまだ保存されていません。")
-
-    if not events_df.empty:
-        ev = events_df.copy()
-        ev["score_rate"] = pd.to_numeric(ev["score_rate"], errors="coerce").fillna(0).round(1)
-        ev = ev.rename(columns={
-            "area": "分野",
-            "event_type": "種類",
-            "title": "内容",
-            "total_count": "問題数",
-            "completed_count": "正解/完了",
-            "score_rate": "正解率%",
-            "created_at": "日時",
-        })
-        st.markdown("#### 自分の最近のテスト履歴")
-        st.dataframe(ev[["分野", "種類", "内容", "問題数", "正解/完了", "正解率%", "日時"]].head(10), use_container_width=True, hide_index=True)
-
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
 def auth_page():
     """ログイン前だけ表示する登録 / ログイン画面。"""
     st.markdown(
         """
         <div class="hero">
           <span class="pill">Login Required</span><span class="pill">Email Account</span>
-          <h1>英検語彙ダッシュボード</h1>
+          <h1>Learning Engish Dashbord</h1>
           <p>メールアドレスで登録またはログインしてから、サービスを使用できます。</p>
         </div>
         """,
@@ -770,6 +270,872 @@ def ensure_user_vocab_columns(cur):
         WHERE next_review_date IS NULL OR next_review_date = ''
         """
     )
+
+
+def ensure_vocab_strategy_tables(cur):
+    """単語横断整理・忘却曲線レビュー用テーブルを追加します。"""
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS vocab_group_reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            group_type TEXT NOT NULL,
+            group_key TEXT NOT NULL,
+            title TEXT NOT NULL,
+            review_count INTEGER DEFAULT 0,
+            ease_factor REAL DEFAULT 2.5,
+            interval_days INTEGER DEFAULT 0,
+            repetitions INTEGER DEFAULT 0,
+            lapses INTEGER DEFAULT 0,
+            last_reviewed_at TEXT DEFAULT '',
+            next_review_date TEXT DEFAULT '',
+            status TEXT DEFAULT '未学習',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, group_type, group_key)
+        )
+        """
+    )
+
+
+COMMON_PHRASES = {
+    "adhere": [("adhere to", "〜に固執する、〜を守る、〜に従う")],
+    "comply": [("comply with", "〜に従う、〜を守る")],
+    "conform": [("conform to", "〜に従う、〜に一致する")],
+    "consist": [("consist of", "〜から成る"), ("consist in", "〜にある、本質が〜にある")],
+    "depend": [("depend on", "〜に依存する、〜次第である")],
+    "rely": [("rely on", "〜に頼る、〜を信頼する")],
+    "insist": [("insist on", "〜を強く主張する")],
+    "persist": [("persist in", "〜をし続ける、固執する")],
+    "result": [("result in", "〜という結果になる"), ("result from", "〜から生じる")],
+    "stem": [("stem from", "〜に由来する、〜から生じる")],
+    "attribute": [("attribute A to B", "AをBのせい・おかげだと考える")],
+    "accuse": [("accuse A of B", "AをBのことで非難する、告発する")],
+    "deprive": [("deprive A of B", "AからBを奪う")],
+    "remind": [("remind A of B", "AにBを思い出させる")],
+    "prevent": [("prevent A from doing", "Aが〜するのを防ぐ")],
+    "prohibit": [("prohibit A from doing", "Aが〜することを禁止する")],
+    "distinguish": [("distinguish A from B", "AとBを区別する")],
+    "derive": [("derive from", "〜に由来する")],
+    "dispose": [("dispose of", "〜を処分する")],
+    "cope": [("cope with", "〜に対処する")],
+    "deal": [("deal with", "〜に対処する、〜を扱う")],
+    "object": [("object to", "〜に反対する")],
+    "appeal": [("appeal to", "〜に訴える、魅力がある")],
+    "refer": [("refer to", "〜に言及する、〜を参照する")],
+    "amount": [("amount to", "合計〜になる、結局〜に等しい")],
+    "account": [("account for", "〜を説明する、〜の割合を占める")],
+    "bring": [("bring about", "〜を引き起こす")],
+    "carry": [("carry out", "〜を実行する")],
+    "figure": [("figure out", "〜を理解する、解決する")],
+    "look": [("look into", "〜を調査する"), ("look up", "〜を調べる")],
+    "take": [("take over", "〜を引き継ぐ"), ("take into account", "〜を考慮に入れる")],
+    "give": [("give up", "〜をあきらめる"), ("give in", "屈する")],
+    "put": [("put off", "〜を延期する"), ("put up with", "〜に耐える")],
+    "come": [("come up with", "〜を思いつく")],
+    "make": [("make up for", "〜を埋め合わせる")],
+    "run": [("run into", "〜に偶然会う、問題にぶつかる"), ("run out of", "〜を使い果たす")],
+}
+
+ANTONYM_PAIRS = [
+    ("increase", "decrease"), ("expand", "shrink"), ("accept", "reject"),
+    ("include", "exclude"), ("major", "minor"), ("optimistic", "pessimistic"),
+    ("positive", "negative"), ("temporary", "permanent"), ("ancient", "modern"),
+    ("private", "public"), ("domestic", "foreign"), ("import", "export"),
+    ("advantage", "disadvantage"), ("efficient", "inefficient"), ("active", "passive"),
+    ("visible", "invisible"), ("legal", "illegal"), ("formal", "informal"),
+    ("internal", "external"), ("superior", "inferior"), ("maximum", "minimum"),
+    ("scarce", "abundant"), ("urban", "rural"), ("voluntary", "compulsory"),
+    ("construct", "destroy"), ("permit", "prohibit"), ("success", "failure"),
+    ("secure", "insecure"), ("accurate", "inaccurate"), ("relevant", "irrelevant"),
+    ("stable", "unstable"), ("mature", "immature"), ("likely", "unlikely"),
+    ("ordinary", "extraordinary"), ("flexible", "rigid"), ("generous", "stingy"),
+    ("humble", "arrogant"), ("minority", "majority"), ("expand", "contract"),
+]
+
+WORD_FAMILY_HINTS = {
+    "administer": ["administer", "administration", "administrative", "administrator"],
+    "misery": ["misery", "miserable", "miserably"],
+    "vary": ["vary", "various", "variety", "variable", "variation"],
+    "benefit": ["benefit", "beneficial", "beneficiary"],
+    "industry": ["industry", "industrial", "industrious"],
+    "economy": ["economy", "economic", "economical", "economics", "economist"],
+    "politics": ["politics", "political", "politician"],
+    "history": ["history", "historic", "historical", "historian"],
+    "science": ["science", "scientific", "scientist"],
+    "confidence": ["confidence", "confident", "confidential"],
+    "evidence": ["evidence", "evident", "evidently"],
+    "significance": ["significance", "significant", "significantly"],
+    "depend": ["depend", "dependent", "independent", "dependence"],
+    "rely": ["rely", "reliable", "reliability", "unreliable"],
+    "create": ["create", "creation", "creative", "creativity", "creator"],
+    "destroy": ["destroy", "destruction", "destructive"],
+    "produce": ["produce", "product", "production", "productive", "producer"],
+    "consume": ["consume", "consumer", "consumption", "consumable"],
+    "compete": ["compete", "competition", "competitive", "competitor"],
+    "permit": ["permit", "permission", "permissible"],
+    "decide": ["decide", "decision", "decisive", "decidedly"],
+    "explain": ["explain", "explanation", "explanatory"],
+    "describe": ["describe", "description", "descriptive"],
+    "compare": ["compare", "comparison", "comparative", "comparable"],
+    "analyze": ["analyze", "analysis", "analytical", "analyst"],
+    "benefit": ["benefit", "beneficial", "beneficiary"],
+    "participate": ["participate", "participation", "participant", "participatory"],
+    "maintain": ["maintain", "maintenance", "maintainable"],
+    "recognize": ["recognize", "recognition", "recognizable"],
+    "apply": ["apply", "application", "applicant", "applicable"],
+    "destroy": ["destroy", "destruction", "destructive"],
+    "construct": ["construct", "construction", "constructive"],
+    "protect": ["protect", "protection", "protective"],
+    "attract": ["attract", "attraction", "attractive"],
+    "inform": ["inform", "information", "informative"],
+}
+
+
+def _clean_word(w):
+    import re
+    w = str(w or "").strip().lower()
+    w = re.sub(r"^[^a-z]+|[^a-z]+$", "", w)
+    return w
+
+
+def _soundex(word):
+    word = _clean_word(word)
+    if not word:
+        return ""
+    first = word[0].upper()
+    mapping = {
+        **dict.fromkeys(list("bfpv"), "1"),
+        **dict.fromkeys(list("cgjkqsxz"), "2"),
+        **dict.fromkeys(list("dt"), "3"),
+        "l": "4",
+        **dict.fromkeys(list("mn"), "5"),
+        "r": "6",
+    }
+    digits = []
+    prev = mapping.get(word[0], "")
+    for ch in word[1:]:
+        d = mapping.get(ch, "")
+        if d and d != prev:
+            digits.append(d)
+        prev = d
+    return (first + "".join(digits) + "000")[:4]
+
+
+def _family_root(word):
+    w = _clean_word(word)
+    irregular = {
+        "administer": "administ", "administration": "administ", "administrative": "administ", "administrator": "administ",
+        "miserable": "miser", "misery": "miser", "miserably": "miser",
+        "various": "vari", "variety": "vari", "variable": "vari", "variation": "vari",
+        "beneficial": "benefit", "beneficiary": "benefit",
+        "economic": "econom", "economical": "econom", "economist": "econom",
+        "analysis": "analy", "analytical": "analy", "analyst": "analy", "analyze": "analy",
+        "maintenance": "maintain", "recognition": "recogniz", "recognizable": "recogniz",
+        "application": "apply", "applicant": "apply", "applicable": "apply",
+    }
+    if w in irregular:
+        return irregular[w]
+    suffixes = ["ically", "ability", "ibility", "ation", "ition", "ously", "fully", "less", "ness", "ment", "ence", "ance", "able", "ible", "tion", "sion", "ity", "ive", "ous", "ial", "ical", "ally", "ing", "ed", "er", "or", "ly", "al", "ic", "ize", "ise", "ate"]
+    for suf in suffixes:
+        if w.endswith(suf) and len(w) > len(suf) + 3:
+            return w[:-len(suf)]
+    if w.endswith("y") and len(w) > 5:
+        return w[:-1]
+    return w
+
+
+POS_OVERRIDES = {
+    "administer": "verb",
+    "administration": "noun",
+    "administrative": "adj",
+    "administrator": "noun",
+    "misery": "noun",
+    "miserable": "adj",
+    "miserably": "adv",
+    "vary": "verb",
+    "various": "adj",
+    "variety": "noun",
+    "variable": "adj/noun",
+    "variation": "noun",
+    "benefit": "noun/verb",
+    "beneficial": "adj",
+    "beneficiary": "noun",
+    "industry": "noun",
+    "industrial": "adj",
+    "industrious": "adj",
+    "economy": "noun",
+    "economic": "adj",
+    "economical": "adj",
+    "economics": "noun",
+    "economist": "noun",
+    "politics": "noun",
+    "political": "adj",
+    "politician": "noun",
+    "history": "noun",
+    "historic": "adj",
+    "historical": "adj",
+    "historian": "noun",
+    "science": "noun",
+    "scientific": "adj",
+    "scientist": "noun",
+    "confidence": "noun",
+    "confident": "adj",
+    "confidential": "adj",
+    "evidence": "noun",
+    "evident": "adj",
+    "evidently": "adv",
+    "significance": "noun",
+    "significant": "adj",
+    "significantly": "adv",
+    "depend": "verb",
+    "dependent": "adj/noun",
+    "independent": "adj",
+    "dependence": "noun",
+    "rely": "verb",
+    "reliable": "adj",
+    "reliability": "noun",
+    "unreliable": "adj",
+    "create": "verb",
+    "creation": "noun",
+    "creative": "adj",
+    "creativity": "noun",
+    "creator": "noun",
+    "destroy": "verb",
+    "destruction": "noun",
+    "destructive": "adj",
+    "produce": "verb",
+    "product": "noun",
+    "production": "noun",
+    "productive": "adj",
+    "producer": "noun",
+    "consume": "verb",
+    "consumer": "noun",
+    "consumption": "noun",
+    "consumable": "adj/noun",
+    "compete": "verb",
+    "competition": "noun",
+    "competitive": "adj",
+    "competitor": "noun",
+    "permit": "verb/noun",
+    "permission": "noun",
+    "permissible": "adj",
+    "decide": "verb",
+    "decision": "noun",
+    "decisive": "adj",
+    "decidedly": "adv",
+    "explain": "verb",
+    "explanation": "noun",
+    "explanatory": "adj",
+    "describe": "verb",
+    "description": "noun",
+    "descriptive": "adj",
+    "compare": "verb",
+    "comparison": "noun",
+    "comparative": "adj/noun",
+    "comparable": "adj",
+    "analyze": "verb",
+    "analysis": "noun",
+    "analytical": "adj",
+    "analyst": "noun",
+    "participate": "verb",
+    "participation": "noun",
+    "participant": "noun",
+    "participatory": "adj",
+    "maintain": "verb",
+    "maintenance": "noun",
+    "maintainable": "adj",
+    "recognize": "verb",
+    "recognition": "noun",
+    "recognizable": "adj",
+    "apply": "verb",
+    "application": "noun",
+    "applicant": "noun",
+    "applicable": "adj",
+    "construct": "verb",
+    "construction": "noun",
+    "constructive": "adj",
+    "protect": "verb",
+    "protection": "noun",
+    "protective": "adj",
+    "attract": "verb",
+    "attraction": "noun",
+    "attractive": "adj",
+    "inform": "verb",
+    "information": "noun",
+    "informative": "adj",
+}
+
+
+def infer_part_of_speech(word):
+    """派生語表示用の簡易品詞推定。手動辞書を優先し、一般的な語尾で補完します。"""
+    w = _clean_word(word)
+    if not w:
+        return ""
+    if w in POS_OVERRIDES:
+        return POS_OVERRIDES[w]
+
+    # 副詞
+    if w.endswith("ly") and len(w) > 4:
+        return "adv"
+
+    # 名詞になりやすい語尾
+    noun_suffixes = (
+        "tion", "sion", "ation", "ition", "ment", "ness", "ity",
+        "ence", "ance", "cy", "ism", "ist", "or", "er",
+        "ship", "hood", "ure", "al", "age", "dom"
+    )
+    if w.endswith(noun_suffixes):
+        return "noun"
+
+    # 形容詞になりやすい語尾
+    adj_suffixes = (
+        "ive", "ative", "able", "ible", "al", "ial", "ical",
+        "ous", "ious", "ful", "less", "ent", "ant", "ary", "ory"
+    )
+    if w.endswith(adj_suffixes):
+        return "adj"
+
+    # 動詞になりやすい語尾
+    verb_suffixes = ("ize", "ise", "ify", "ate", "en")
+    if w.endswith(verb_suffixes):
+        return "verb"
+
+    return "word"
+
+
+def format_word_with_pos(word):
+    word_text = str(word or "").strip()
+    pos = infer_part_of_speech(word_text)
+    return f"{word_text} ({pos})" if pos else word_text
+
+
+def _load_passitan_words_for_strategy():
+    con = connect()
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT id, no, word, meaning, example_sentence, source, known
+            FROM passitan_words
+            ORDER BY no
+            """,
+            con,
+        )
+    except Exception:
+        df = pd.DataFrame()
+    finally:
+        con.close()
+    if df.empty:
+        return df
+    df["word_clean"] = df["word"].apply(_clean_word)
+    df = df[df["word_clean"] != ""].copy()
+    df["grade_label"] = df["source"].apply(passitan_grade_label) if "source" in df.columns else ""
+    df["display_no"] = df.apply(passitan_display_no, axis=1) if "source" in df.columns else df["no"]
+    return df
+
+
+def _phrase_list_for_word(word):
+    w = _clean_word(word)
+    return COMMON_PHRASES.get(w, [])
+
+
+def format_phrase_for_word(word):
+    phrases = _phrase_list_for_word(word)
+    if not phrases:
+        return ""
+    return " / ".join([f"{p}: {m}" for p, m in phrases])
+
+
+def format_word_family_hint_for_word(word):
+    """手動登録した品詞派生ヒントを、該当単語から直接表示できる文字列にします。"""
+    wc = _clean_word(word)
+    if not wc:
+        return ""
+
+    for root, variants in WORD_FAMILY_HINTS.items():
+        cleaned_variants = [_clean_word(v) for v in variants]
+        # administer のように、動詞と administration / administrative のrootが単純一致しないものも、
+        # WORD_FAMILY_HINTS に入っていれば必ず表示します。
+        if wc == _clean_word(root) or wc in cleaned_variants:
+            labels = []
+            seen = set()
+            for v in variants:
+                vc = _clean_word(v)
+                if vc and vc not in seen:
+                    seen.add(vc)
+                    labels.append(format_word_with_pos(v))
+            return " / ".join(labels)
+    return ""
+
+
+def build_vocab_strategy_index(groups=None):
+    """単語ごとに、同義語・反対語・発音注意・品詞派生・熟語セットを引ける辞書を作ります。"""
+    groups = groups if groups is not None else build_vocab_strategy_groups(max_each=200)
+    index = {}
+    for g in groups:
+        for w in g.get("words", []):
+            wc = _clean_word(w)
+            if wc:
+                index.setdefault(wc, []).append(g)
+        # 反対語タイトル "a ⇔ b" のようなものも拾う
+        title = str(g.get("title", ""))
+        if "⇔" in title:
+            for part in title.split("⇔"):
+                wc = _clean_word(part)
+                if wc:
+                    index.setdefault(wc, []).append(g)
+    return index
+
+
+def get_vocab_strategy_items_for_word(word, strategy_index=None):
+    """パス単カードに表示する関連情報をカテゴリ別に返します。"""
+    wc = _clean_word(word)
+    if not wc:
+        return []
+    strategy_index = strategy_index or build_vocab_strategy_index()
+    groups = strategy_index.get(wc, [])
+    items = []
+    seen = set()
+
+    # 熟語は必ずCOMMON_PHRASESから表示
+    phrase_text = format_phrase_for_word(word)
+    if phrase_text:
+        items.append(("熟語", phrase_text))
+        seen.add(("熟語", phrase_text))
+
+    # administer -> administration / administrative のような、語根だけでは拾いにくい派生語を補強表示
+    family_hint_text = format_word_family_hint_for_word(word)
+    if family_hint_text:
+        items.append(("品詞派生", family_hint_text))
+        seen.add(("品詞派生", family_hint_text))
+
+    label_map = {
+        "同義語": "同義語",
+        "反対語": "反対語",
+        "発音注意": "発音が近い",
+        "品詞派生": "品詞派生",
+        "熟語セット": "熟語",
+    }
+    order = {"同義語": 1, "反対語": 2, "発音注意": 3, "品詞派生": 4, "熟語セット": 5}
+    for g in sorted(groups, key=lambda x: order.get(x.get("type", ""), 99)):
+        gtype = str(g.get("type", ""))
+        label = label_map.get(gtype, gtype or "関連")
+        words = [str(x) for x in g.get("words", []) if str(x).strip()]
+        others = [x for x in words if _clean_word(x) != wc]
+
+        if gtype == "熟語セット":
+            text = str(g.get("details", "")).replace(" = ", ": ")
+            if not text or text == phrase_text:
+                continue
+        elif gtype == "反対語":
+            text = " / ".join(others) if others else str(g.get("title", ""))
+            if g.get("meaning"):
+                text = f"{text}（{g.get('meaning')}）"
+        elif gtype == "同義語":
+            text = " / ".join(others) if others else str(g.get("details", ""))
+        elif gtype == "発音注意":
+            text = " / ".join(others) if others else str(g.get("title", ""))
+            examples = str(g.get("examples", "")).strip()
+            if examples:
+                text = f"{text}｜{examples}"
+        elif gtype == "品詞派生":
+            text = " / ".join([format_word_with_pos(x) for x in words])
+            details = str(g.get("details", "")).strip()
+            if details and details not in text:
+                text = f"{text}｜{details}"
+        else:
+            text = str(g.get("details", "")) or " / ".join(others)
+
+        text = " ".join(str(text or "").split())
+        if not text:
+            continue
+        key = (label, text)
+        if key not in seen:
+            seen.add(key)
+            items.append((label, text))
+
+    return items
+
+
+def render_vocab_strategy_items_html(word, strategy_index=None, compact=False):
+    items = get_vocab_strategy_items_for_word(word, strategy_index=strategy_index)
+    if not items:
+        return ""
+    max_items = 5 if compact else 8
+    html_lines = []
+    for label, text in items[:max_items]:
+        html_lines.append(
+            f'<div class="passitan-related-line"><span class="passitan-related-label">{html.escape(label)}</span> {html.escape(text)}</div>'
+        )
+    return '<div class="passitan-related-box">' + ''.join(html_lines) + '</div>'
+
+
+def build_vocab_strategy_groups(max_each=120):
+    """DB内の単語を横断して、覚えやすいグループを自動生成します。"""
+    words_df = _load_passitan_words_for_strategy()
+    groups = []
+    if words_df.empty:
+        return groups
+
+    word_set = set(words_df["word_clean"].tolist())
+    word_meta = {r["word_clean"]: r for _, r in words_df.iterrows()}
+
+    # 1) 熟語・セット表現
+    for w, phrases in COMMON_PHRASES.items():
+        if w in word_set:
+            r = word_meta[w]
+            groups.append({
+                "type": "熟語セット",
+                "key": f"phrase::{w}",
+                "title": str(r["word"]),
+                "words": [str(r["word"])],
+                "meaning": str(r.get("meaning", "")),
+                "details": " / ".join([f"{p} = {m}" for p, m in phrases]),
+                "reason": "単語単体ではなく、前置詞・型とセットで覚える",
+                "examples": str(r.get("example_sentence", "")),
+            })
+
+    # 2) 同義語：questionsテーブルのsynonymsを利用
+    con = connect()
+    try:
+        qdf = pd.read_sql_query("SELECT question, choices_json, answer, synonyms FROM questions WHERE synonyms IS NOT NULL AND synonyms != ''", con)
+    except Exception:
+        qdf = pd.DataFrame()
+    finally:
+        con.close()
+    for _, row in qdf.iterrows():
+        try:
+            choices = json.loads(row.get("choices_json", "[]"))
+            ans = int(row.get("answer", 0))
+            correct = str(choices[ans - 1]) if 1 <= ans <= len(choices) else ""
+        except Exception:
+            correct = ""
+        if not correct:
+            continue
+        syns = [x.strip() for x in str(row.get("synonyms", "")).replace(";", ",").split(",") if x.strip()]
+        if syns:
+            groups.append({
+                "type": "同義語",
+                "key": f"syn::{_clean_word(correct)}",
+                "title": correct,
+                "words": [correct] + syns[:6],
+                "meaning": "似た意味の単語をまとめて覚える",
+                "details": ", ".join(syns[:8]),
+                "reason": "選択肢問題では、言い換え・類義語で理解できると強い",
+                "examples": str(row.get("question", "")),
+            })
+
+    # 3) 反対語：辞書ペア + DB内にあるものを優先表示
+    for a, b in ANTONYM_PAIRS:
+        if a in word_set or b in word_set:
+            ar = word_meta.get(a)
+            br = word_meta.get(b)
+            a_mean = str(ar.get("meaning", "")) if ar is not None else ""
+            b_mean = str(br.get("meaning", "")) if br is not None else ""
+            groups.append({
+                "type": "反対語",
+                "key": f"ant::{a}::{b}",
+                "title": f"{a} ⇔ {b}",
+                "words": [a, b],
+                "meaning": f"{a_mean} / {b_mean}".strip(" /"),
+                "details": f"{a} の反対語: {b}",
+                "reason": "反対語で覚えると意味の境界がはっきりする",
+                "examples": "",
+            })
+
+    # 4) 品詞派生：名詞・形容詞・副詞などを同じrootでまとめる
+    fam = {}
+    for _, r in words_df.iterrows():
+        w = str(r["word_clean"])
+        if len(w) >= 4 and " " not in w:
+            fam.setdefault(_family_root(w), []).append(r)
+    for root, rows in fam.items():
+        uniq = []
+        seen = set()
+        for r in rows:
+            wc = str(r["word_clean"])
+            if wc not in seen:
+                seen.add(wc); uniq.append(r)
+        if len(uniq) >= 2:
+            labels = [str(r["word"]) for r in uniq[:8]]
+            display_labels = [format_word_with_pos(r["word"]) for r in uniq[:8]]
+            meanings = [f"{format_word_with_pos(r['word'])}: {r.get('meaning','')}" for r in uniq[:5]]
+            groups.append({
+                "type": "品詞派生",
+                "key": f"family::{root}",
+                "title": " / ".join(display_labels[:4]),
+                "words": labels,
+                "meaning": " | ".join(meanings),
+                "details": "同じ語根・派生語として整理",
+                "reason": "名詞・形容詞・副詞をセットで覚える。例: misery / miserable",
+                "examples": " / ".join([str(r.get("example_sentence", "")) for r in uniq[:2] if str(r.get("example_sentence", ""))]),
+            })
+
+    # 手動ヒントで代表的な品詞派生を補強
+    for root, variants in WORD_FAMILY_HINTS.items():
+        present = [w for w in variants if _clean_word(w) in word_set]
+        if len(present) >= 2:
+            groups.append({
+                "type": "品詞派生",
+                "key": f"familyhint::{root}",
+                "title": " / ".join([format_word_with_pos(w) for w in present]),
+                "words": present,
+                "meaning": "派生語をセットで暗記",
+                "details": " → ".join([format_word_with_pos(w) for w in present]),
+                "reason": "同じ語根から品詞を横に広げる",
+                "examples": "",
+            })
+
+    # 5) 発音が近くて間違いやすい：Soundex近似 + 長さが近いもの
+    sound_groups = {}
+    for _, r in words_df.iterrows():
+        w = str(r["word_clean"])
+        if len(w) >= 5 and " " not in w:
+            sound_groups.setdefault(_soundex(w), []).append(r)
+    for code, rows in sound_groups.items():
+        uniq = []
+        seen = set()
+        for r in rows:
+            wc = str(r["word_clean"])
+            if wc not in seen:
+                seen.add(wc); uniq.append(r)
+        if 2 <= len(uniq) <= 8:
+            labels = [str(r["word"]) for r in uniq]
+            # あまりにも関係ない大集団を避けるため、先頭文字または長さ差を軽く確認
+            if max(len(_clean_word(x)) for x in labels) - min(len(_clean_word(x)) for x in labels) <= 4:
+                groups.append({
+                    "type": "発音注意",
+                    "key": f"sound::{code}::{'-'.join(sorted([_clean_word(x) for x in labels])[:5])}",
+                    "title": " / ".join(labels[:5]),
+                    "words": labels,
+                    "meaning": "発音・綴りが近く、選択肢で混同しやすい",
+                    "details": f"音声コード: {code}",
+                    "reason": "見た目・音が近い単語は、意味を対比して覚える",
+                    "examples": " | ".join([f"{r['word']}: {r.get('meaning','')}" for r in uniq[:5]]),
+                })
+
+    # 重複を削除し、タイプごとに上限
+    dedup = []
+    seen_keys = set()
+    counts = {}
+    priority = {"熟語セット": 0, "同義語": 1, "反対語": 2, "品詞派生": 3, "発音注意": 4}
+    for g in sorted(groups, key=lambda x: (priority.get(x["type"], 9), x["key"])):
+        if g["key"] in seen_keys:
+            continue
+        if counts.get(g["type"], 0) >= max_each:
+            continue
+        seen_keys.add(g["key"])
+        counts[g["type"]] = counts.get(g["type"], 0) + 1
+        dedup.append(g)
+    return dedup
+
+
+def load_vocab_group_reviews(user_id):
+    con = connect()
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT group_type, group_key, review_count, ease_factor, interval_days,
+                   repetitions, lapses, last_reviewed_at, next_review_date, status
+            FROM vocab_group_reviews
+            WHERE user_id=?
+            """,
+            con,
+            params=(int(user_id),),
+        )
+    except Exception:
+        df = pd.DataFrame()
+    finally:
+        con.close()
+    return df
+
+
+def review_vocab_group(user_id, group_type, group_key, title, result):
+    con = connect()
+    cur = con.cursor()
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO vocab_group_reviews
+        (user_id, group_type, group_key, title, next_review_date)
+        VALUES (?, ?, ?, ?, DATE('now'))
+        """,
+        (int(user_id), str(group_type), str(group_key), str(title)),
+    )
+    cur.execute(
+        """
+        SELECT ease_factor, interval_days, repetitions, lapses
+        FROM vocab_group_reviews
+        WHERE user_id=? AND group_type=? AND group_key=?
+        """,
+        (int(user_id), str(group_type), str(group_key)),
+    )
+    row = cur.fetchone() or (2.5, 0, 0, 0)
+    ease = float(row[0] or 2.5)
+    interval = int(row[1] or 0)
+    reps = int(row[2] or 0)
+    lapses = int(row[3] or 0)
+
+    if result == "again":
+        reps = 0; interval = 1; ease = max(1.3, ease - 0.25); lapses += 1; status = "復習中"
+    elif result == "hard":
+        reps += 1; interval = max(1, int(round(max(interval, 1) * 1.2))); ease = max(1.3, ease - 0.15); status = "復習中"
+    elif result == "easy":
+        reps += 1
+        interval = 3 if reps <= 1 else 7 if reps == 2 else max(interval + 1, int(round(interval * (ease + 0.35))))
+        ease = min(3.2, ease + 0.15); status = "覚えた" if interval >= 14 else "復習中"
+    else:
+        reps += 1
+        interval = 1 if reps <= 1 else 3 if reps == 2 else max(interval + 1, int(round(interval * ease)))
+        status = "覚えた" if interval >= 14 else "復習中"
+
+    next_date = (date.today() + timedelta(days=interval)).isoformat()
+    cur.execute(
+        """
+        UPDATE vocab_group_reviews
+        SET title=?, status=?, review_count=review_count+1, ease_factor=?, interval_days=?,
+            repetitions=?, lapses=?, last_reviewed_at=DATE('now'), next_review_date=?, updated_at=CURRENT_TIMESTAMP
+        WHERE user_id=? AND group_type=? AND group_key=?
+        """,
+        (str(title), status, ease, interval, reps, lapses, next_date, int(user_id), str(group_type), str(group_key)),
+    )
+    con.commit(); con.close()
+    return next_date
+
+
+def vocab_strategy_page():
+    st.subheader("🧩 単語整理・忘却曲線プラン")
+    st.caption("DB内の単語を横断して、反対語・同義語・発音注意・品詞派生・熟語セットで整理します。グループ単位で復習日も管理できます。")
+
+    groups = build_vocab_strategy_groups(max_each=160)
+    if not groups:
+        st.warning("単語データが見つかりません。passitan_words テーブルを確認してください。")
+        return
+
+    user_id = int(st.session_state.get("auth_user_id", 0) or 0)
+    review_df = load_vocab_group_reviews(user_id) if user_id else pd.DataFrame()
+    review_map = {}
+    if not review_df.empty:
+        for _, r in review_df.iterrows():
+            review_map[(str(r["group_type"]), str(r["group_key"]))] = r.to_dict()
+
+    for g in groups:
+        r = review_map.get((g["type"], g["key"]), {})
+        g["next_review_date"] = str(r.get("next_review_date", "")) or today_iso()
+        g["status"] = str(r.get("status", "未学習") or "未学習")
+        g["review_count"] = int(r.get("review_count", 0) or 0)
+        g["is_due"] = g["next_review_date"] <= today_iso()
+
+    summary_df = pd.DataFrame([{
+        "分類": g["type"],
+        "タイトル": g["title"],
+        "単語": ", ".join(g["words"][:8]),
+        "説明": g["details"],
+        "次回復習": g["next_review_date"],
+        "状態": g["status"],
+        "復習回数": g["review_count"],
+    } for g in groups])
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("整理グループ数", len(groups))
+    c2.metric("今日復習", sum(1 for g in groups if g["is_due"]))
+    c3.metric("熟語セット", sum(1 for g in groups if g["type"] == "熟語セット"))
+    c4.metric("品詞派生", sum(1 for g in groups if g["type"] == "品詞派生"))
+
+    tab_due, tab_all, tab_export = st.tabs(["今日の復習", "分類別に見る", "CSV出力"])
+
+    with tab_due:
+        due_groups = [g for g in groups if g["is_due"]]
+        if not due_groups:
+            st.success("今日復習するグループはありません。")
+        else:
+            type_filter = st.multiselect(
+                "復習する分類",
+                ["熟語セット", "同義語", "反対語", "発音注意", "品詞派生"],
+                default=["熟語セット", "同義語", "反対語", "発音注意", "品詞派生"],
+                key="vocab_strategy_due_type_filter",
+            )
+            due_groups = [g for g in due_groups if g["type"] in type_filter]
+            for i, g in enumerate(due_groups[:80], start=1):
+                st.markdown('<div class="card">', unsafe_allow_html=True)
+                st.markdown(
+                    f'<span class="badge">{html.escape(g["type"])}</span>'
+                    f'<span class="badge">次回: {html.escape(g["next_review_date"])}</span>'
+                    f'<span class="badge">復習: {g["review_count"]}回</span>',
+                    unsafe_allow_html=True,
+                )
+                st.markdown(f"### {html.escape(g['title'])}", unsafe_allow_html=True)
+                st.write("**単語:**", " / ".join(g["words"]))
+                if g.get("meaning"):
+                    st.write("**意味:**", g["meaning"])
+                st.write("**整理ポイント:**", g["details"])
+                st.write("**覚え方:**", g["reason"])
+                if g.get("examples"):
+                    st.write("**例文・メモ:**", g["examples"])
+                cols = st.columns(4)
+                for col, (result, label) in zip(cols, [("again", "もう一度"), ("hard", "難しい"), ("good", "覚えた"), ("easy", "簡単")]):
+                    with col:
+                        if st.button(label, key=f"vocab_group_review_{i}_{result}_{g['key']}"):
+                            next_date = review_vocab_group(user_id, g["type"], g["key"], g["title"], result)
+                            st.success(f"次回復習日を {next_date} にしました。")
+                            st.rerun()
+                st.markdown('</div>', unsafe_allow_html=True)
+
+    with tab_all:
+        selected_type = st.selectbox(
+            "分類を選択",
+            ["すべて", "熟語セット", "同義語", "反対語", "発音注意", "品詞派生"],
+            key="vocab_strategy_type",
+        )
+        keyword = st.text_input("検索", placeholder="例: adhere / miserable / decrease", key="vocab_strategy_keyword")
+        view_groups = groups
+        if selected_type != "すべて":
+            view_groups = [g for g in view_groups if g["type"] == selected_type]
+        if keyword:
+            k = keyword.lower().strip()
+            view_groups = [g for g in view_groups if k in (g["title"] + " " + " ".join(g["words"]) + " " + g.get("details", "") + " " + g.get("meaning", "")).lower()]
+
+        st.info(f"表示グループ: {len(view_groups)}件")
+        for i, g in enumerate(view_groups[:150], start=1):
+            with st.expander(f"{g['type']}｜{g['title']}｜次回 {g['next_review_date']}", expanded=False):
+                st.write("**単語:**", " / ".join(g["words"]))
+                if g.get("meaning"):
+                    st.write("**意味:**", g["meaning"])
+                st.write("**整理ポイント:**", g["details"])
+                st.write("**覚え方:**", g["reason"])
+                if g.get("examples"):
+                    st.write("**例文・メモ:**", g["examples"])
+                c1, c2 = st.columns([1, 3])
+                with c1:
+                    if st.button("今日復習に入れる", key=f"vocab_group_due_{i}_{g['key']}"):
+                        con = connect(); cur = con.cursor()
+                        cur.execute(
+                            """
+                            INSERT OR IGNORE INTO vocab_group_reviews
+                            (user_id, group_type, group_key, title, next_review_date)
+                            VALUES (?, ?, ?, ?, DATE('now'))
+                            """,
+                            (user_id, g["type"], g["key"], g["title"]),
+                        )
+                        cur.execute(
+                            """
+                            UPDATE vocab_group_reviews
+                            SET next_review_date=DATE('now'), updated_at=CURRENT_TIMESTAMP
+                            WHERE user_id=? AND group_type=? AND group_key=?
+                            """,
+                            (user_id, g["type"], g["key"]),
+                        )
+                        con.commit(); con.close()
+                        st.success("今日の復習に入れました。")
+                        st.rerun()
+
+    with tab_export:
+        st.download_button(
+            "単語整理CSVをダウンロード",
+            summary_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="vocab_strategy_groups.csv",
+            mime="text/csv",
+        )
+        st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
 
 def init_db():
@@ -857,58 +1223,6 @@ def init_db():
         """
     )
 
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS user_progress (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            area TEXT NOT NULL,
-            payload_json TEXT NOT NULL DEFAULT '{}',
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(user_id, area)
-        )
-        """
-    )
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS user_study_progress (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            area TEXT NOT NULL,
-            item_key TEXT NOT NULL,
-            title TEXT NOT NULL,
-            unit TEXT DEFAULT '',
-            section_no TEXT DEFAULT '',
-            total_count INTEGER DEFAULT 0,
-            completed_count INTEGER DEFAULT 0,
-            score_rate REAL DEFAULT 0,
-            status TEXT DEFAULT '学習中',
-            payload_json TEXT NOT NULL DEFAULT '{}',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(user_id, area, item_key)
-        )
-        """
-    )
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS user_study_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            area TEXT NOT NULL,
-            event_type TEXT NOT NULL,
-            title TEXT NOT NULL,
-            total_count INTEGER DEFAULT 0,
-            completed_count INTEGER DEFAULT 0,
-            score_rate REAL DEFAULT 0,
-            payload_json TEXT NOT NULL DEFAULT '{}',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-
     # app.py と同じフォルダに CSV がある場合、パス単データを自動取り込みします。
     csv_path = APP_DIR / "eiken_jun1_passitan_wordlist_enriched.csv"
     if csv_path.exists():
@@ -940,6 +1254,7 @@ def init_db():
             pass
 
     ensure_user_vocab_columns(cur)
+    ensure_vocab_strategy_tables(cur)
 
     cur.execute("SELECT COUNT(*) FROM questions")
     count = cur.fetchone()[0]
@@ -962,6 +1277,30 @@ def init_db():
     con.close()
 
 
+def normalize_question_grade_label(grade_value, tags_value=""):
+    """questions.grade / tags から、試験問題画面用の級ラベルを作ります。"""
+    text = f"{grade_value or ''} {tags_value or ''}".replace("１", "1").lower()
+    if "準1" in text or "準１" in text or "pre-1" in text or "pre1" in text:
+        return "英検準1級"
+    if "英検1級" in text or "英検 1級" in text or "grade 1" in text or text.strip() in {"1", "1級", "grade1"}:
+        return "英検1級"
+    if str(grade_value or "").strip():
+        return str(grade_value).strip()
+    return "その他"
+
+
+def normalize_question_category(tags_value="", question_value=""):
+    """tags から Vocabulary / Reading / Grammar を判定します。"""
+    text = f"{tags_value or ''} {question_value or ''}".lower()
+    if any(k.lower() in text for k in ["reading", "読解", "リーディング", "長文"]):
+        return "Reading"
+    if any(k.lower() in text for k in ["grammar", "文法", "グラマー", "語法"]):
+        return "Grammar"
+    if any(k.lower() in text for k in ["vocabulary", "vocab", "語彙", "単語"]):
+        return "Vocabulary"
+    return "Vocabulary"
+
+
 def load_questions():
     con = connect()
     df = pd.read_sql_query("SELECT * FROM questions ORDER BY year, CAST(session AS INTEGER), qno", con)
@@ -974,6 +1313,8 @@ def load_questions():
     df["year"] = df["year"].astype(str).str.strip()
     df["session"] = df["session"].astype(str).str.strip()
     df["exam"] = df["year"] + "-" + df["session"]
+    df["question_grade_label"] = df.apply(lambda r: normalize_question_grade_label(r.get("grade", ""), r.get("tags", "")), axis=1)
+    df["question_category"] = df.apply(lambda r: normalize_question_category(r.get("tags", ""), r.get("question", "")), axis=1)
     return df
 
 
@@ -1060,6 +1401,150 @@ def load_passitan_words():
     con.close()
     return df
 
+
+
+def get_query_param_value(name, default=""):
+    """StreamlitのURLクエリから値を安全に1つ取り出します。"""
+    try:
+        value = st.query_params.get(name, default)
+    except Exception:
+        try:
+            params = st.experimental_get_query_params()
+            value = params.get(name, [default])
+        except Exception:
+            value = default
+    if isinstance(value, list):
+        return value[0] if value else default
+    return value if value is not None else default
+
+
+def apply_passitan_jump_from_query():
+    """試験問題のリンクからパス単へ移動するためのURLパラメータを処理します。
+
+    st.radio(key="main_page") を生成した後に main_page を直接変更すると
+    StreamlitAPIException になるため、ここでは pending_main_page に保存します。
+    sidebar_filters() の radio 生成前に pending_main_page を反映します。
+    """
+    word = str(get_query_param_value("goto_passitan_word", "") or "").strip()
+    if not word:
+        return
+    grade = str(get_query_param_value("goto_passitan_grade", "") or "").strip()
+    no = str(get_query_param_value("goto_passitan_no", "") or "").strip()
+
+    st.session_state["pending_main_page"] = "📗 パス単"
+    st.session_state["passitan_jump_word"] = word
+    if grade:
+        st.session_state["passitan_jump_grade"] = grade
+    if no:
+        st.session_state["passitan_jump_no"] = no
+
+    # URLにパラメータが残ると、検索欄を消しても毎回同じ単語へ戻るため、処理後にクリアします。
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
+
+
+def build_passitan_word_index():
+    """パス単に登録されている単語を、試験問題ハイライト用の辞書にします。"""
+    df = load_passitan_words()
+    if df.empty:
+        return {}
+    df = df.copy()
+    df["grade_label"] = df["source"].apply(passitan_grade_label)
+    df["display_no"] = df.apply(passitan_display_no, axis=1)
+    index = {}
+    for _, row in df.iterrows():
+        word = str(row.get("word", "") or "").strip()
+        if not word:
+            continue
+        key = word.lower()
+        # 同じ単語が複数ある場合は、最初に見つかったものをリンク先にします。
+        index.setdefault(key, {
+            "word": word,
+            "grade": str(row.get("grade_label", "")),
+            "no": int(row.get("display_no", row.get("no", 0)) or 0),
+            "meaning": str(row.get("meaning", "") or ""),
+        })
+    return index
+
+
+def jump_to_passitan_word(info):
+    """同じStreamlitセッション内でパス単へ移動する予約をします。
+
+    main_page は sidebar の radio widget key と同じため、
+    widget生成後に直接書き換えると StreamlitAPIException になります。
+    そのため、ここでは pending_main_page に保存し、次のrerun開始時に反映します。
+    """
+    st.session_state["pending_main_page"] = "📗 パス単"
+    st.session_state["passitan_jump_word"] = str(info.get("word", "") or "")
+    if info.get("grade"):
+        st.session_state["passitan_jump_grade"] = str(info.get("grade", "") or "")
+    if info.get("no"):
+        st.session_state["passitan_jump_no"] = str(info.get("no", "") or "")
+
+
+def _passitan_match_pattern(passitan_index):
+    """パス単語検索用の正規表現を作ります。"""
+    import re
+    if not passitan_index:
+        return None
+    words = [w for w in passitan_index.keys() if len(str(w)) >= 3]
+    if not words:
+        return None
+    words = sorted(words, key=len, reverse=True)
+    return re.compile(r"(?<![A-Za-z])(" + "|".join(re.escape(w) for w in words) + r")(?![A-Za-z])", re.IGNORECASE)
+
+
+def collect_passitan_matches(texts, passitan_index):
+    """文章・選択肢に出たパス単語を重複なしで集めます。"""
+    pattern = _passitan_match_pattern(passitan_index)
+    if pattern is None:
+        return []
+    found = {}
+    for text in texts:
+        for m in pattern.finditer(str(text or "")):
+            info = passitan_index.get(m.group(0).lower())
+            if info:
+                found.setdefault(str(info.get("word", "")).lower(), info)
+    return list(found.values())
+
+
+def highlight_passitan_words(text, passitan_index):
+    """文章中にパス単登録語が出たら、クリック可能な緑色リンクにします。
+
+    追加ボタンは出さず、単語そのものをクリックすると同じStreamlitアプリ内で
+    📗 パス単へ移動し、検索欄にその単語を入れます。
+    """
+    from urllib.parse import urlencode
+
+    text = str(text or "")
+    pattern = _passitan_match_pattern(passitan_index)
+    if not text or pattern is None:
+        return html.escape(text)
+
+    out = []
+    pos = 0
+    for m in pattern.finditer(text):
+        out.append(html.escape(text[pos:m.start()]))
+        matched = m.group(0)
+        info = passitan_index.get(matched.lower())
+        if info:
+            title = f"{info.get('grade', 'パス単') or 'パス単'} No.{info.get('no', '')} / {info.get('meaning', '')}"
+            query = urlencode({
+                "goto_passitan_word": str(info.get("word", matched) or matched),
+                "goto_passitan_grade": str(info.get("grade", "") or ""),
+                "goto_passitan_no": str(info.get("no", "") or ""),
+            })
+            out.append(
+                f'<a class="passitan-hit" href="?{html.escape(query)}" target="_self" '
+                f'title="{html.escape(title)}">{html.escape(matched)}</a>'
+            )
+        else:
+            out.append(html.escape(matched))
+        pos = m.end()
+    out.append(html.escape(text[pos:]))
+    return "".join(out)
 
 def passitan_grade_label(source):
     """source文字列から、パス単画面で使う教材名を作ります。"""
@@ -1600,22 +2085,42 @@ def sidebar_filters(df):
             st.rerun()
     st.sidebar.divider()
 
-    page_options = ["🏠 Overview", "📚 試験問題", "🧠 Quiz", "📗 パス単", "🧪 パス単テスト", "🌟 special-lesson", "📈 学習記録", "📝 単語帳", "📄 PDF生成", "➕ 問題を追加", "🛠 データ管理"]
-    app_progress = load_user_progress("app", {})
-    set_session_default_from_progress("main_page_select", app_progress.get("last_page"), page_options)
+    page_options = ["🏠 Overview", "📚 試験問題", "🧠 Quiz", "📗 パス単", "🧪 パス単テスト", "🧩 単語整理", "📕 TOEFL-5600", "📙 TOEFL-KMF-word", "🔬 scientificamerican.com", "🌟 special-lesson", "📝 単語帳", "📄 PDF生成", "➕ 問題を追加", "🛠 データ管理"]
 
+    # 別画面からの移動予約を、radio widget生成前に反映します。
+    # widget生成後に st.session_state["main_page"] を変更するとエラーになるためです。
+    pending_page = st.session_state.pop("pending_main_page", None)
+    if pending_page in page_options:
+        st.session_state["main_page"] = pending_page
+
+    if st.session_state.get("main_page") not in page_options:
+        st.session_state["main_page"] = page_options[0]
     page = st.sidebar.radio(
         "画面",
         page_options,
-        key="main_page_select",
         label_visibility="collapsed",
+        key="main_page",
     )
 
     question_submenu = None
+    question_grade = None
     if page == "📚 試験問題":
         with st.sidebar.expander("📚 試験問題サブメニュー", expanded=True):
+            grade_candidates = []
+            if not df.empty and "question_grade_label" in df.columns:
+                grade_candidates = df["question_grade_label"].dropna().astype(str).unique().tolist()
+            # DBに英検1級の問題がまだ入っていない場合でも、
+            # 級の選択肢には常に「英検準1級」「英検1級」を表示します。
+            preferred_grades = ["英検準1級", "英検1級"]
+            grade_options = preferred_grades + [g for g in grade_candidates if g not in preferred_grades]
+            question_grade = st.radio(
+                "級を選択",
+                grade_options,
+                index=0,
+                key="question_list_grade",
+            )
             question_submenu = st.radio(
-                "問題タイプ",
+                "カテゴリ",
                 ["Vocabulary", "Reading", "Grammar"],
                 index=0,
                 key="question_list_submenu",
@@ -1657,7 +2162,7 @@ def sidebar_filters(df):
         placeholder="例: remote / 迂回 / alarm"
     )
 
-    return page, selected, keyword, question_submenu
+    return page, selected, keyword, question_submenu, question_grade
 
 
 def apply_filter(df, selected, keyword):
@@ -1677,17 +2182,22 @@ def apply_filter(df, selected, keyword):
     return out
 
 
-def render_card(row, show_answer=True):
+def render_card(row, show_answer=True, passitan_index=None, highlight_passitan=False):
     choices = row["choices"]
     notes = row["choice_notes"]
     correct = choices[int(row["answer"]) - 1]
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown(f'<span class="badge">{row["exam"]}</span><span class="badge">Q{int(row["qno"])}</span><span class="badge">{row.get("difficulty", "標準")}</span>', unsafe_allow_html=True)
-    st.markdown(f'<div class="question"><span class="qnum">({int(row["qno"])})</span> {row["question"]}</div>', unsafe_allow_html=True)
+    question_html = highlight_passitan_words(row["question"], passitan_index) if highlight_passitan else html.escape(str(row["question"]))
+    st.markdown(f'<div class="question"><span class="qnum">({int(row["qno"])})</span> {question_html}</div>', unsafe_allow_html=True)
     cols = st.columns(4)
     for i, ch in enumerate(choices, start=1):
         prefix = "✅" if show_answer and i == int(row["answer"]) else f"{i}."
-        cols[i-1].markdown(f"**{prefix} {ch}**")
+        choice_html = highlight_passitan_words(ch, passitan_index) if highlight_passitan else html.escape(str(ch))
+        cols[i-1].markdown(f'<div class="choice-line"><b>{html.escape(prefix)}</b> {choice_html}</div>', unsafe_allow_html=True)
+
+    # パス単に存在する単語は、問題文・選択肢の中で緑色ハイライトのみ表示します。
+    # 追加の「📗 単語名」ボタンは表示しません。
     if show_answer:
         st.markdown(f'<div class="translation">🇯🇵 {row["translation"]}</div>', unsafe_allow_html=True)
         st.markdown(f'<p class="answer">正解: {int(row["answer"])}. {correct}</p>', unsafe_allow_html=True)
@@ -1733,104 +2243,8 @@ def render_card(row, show_answer=True):
     st.markdown('</div>', unsafe_allow_html=True)
 
 
-
-def render_my_study_overview_visible():
-    """Overviewに必ず表示する本人用サマリー。前回修正が見えない環境でも分かるように、overview()内から直接呼びます。"""
-    st.markdown("## 👤 自分の学習状況（Overview）")
-    user_email = st.session_state.get("auth_email", "")
-    progress_df = pd.DataFrame()
-    events_df = pd.DataFrame()
-    try:
-        progress_df = load_study_progress()
-    except Exception as e:
-        st.warning(f"自分の学習記録を読み込めませんでした: {e}")
-    try:
-        events_df = load_study_events(limit=10)
-    except Exception:
-        events_df = pd.DataFrame()
-
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown(f"**ログイン中:** {html.escape(str(user_email))}", unsafe_allow_html=True)
-
-    if progress_df.empty:
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("自分の全体進捗", "0.0%")
-        c2.metric("記録項目", 0)
-        c3.metric("完了/正解", "0 / 0")
-        c4.metric("最終学習", "-")
-        st.info("まだ自分の学習記録がありません。パス単・パス単テスト・special-lessonを使うと、ここに自動で表示されます。")
-    else:
-        dfp = progress_df.copy()
-        dfp["total_count"] = pd.to_numeric(dfp["total_count"], errors="coerce").fillna(0).astype(int)
-        dfp["completed_count"] = pd.to_numeric(dfp["completed_count"], errors="coerce").fillna(0).astype(int)
-        dfp["score_rate"] = pd.to_numeric(dfp["score_rate"], errors="coerce").fillna(0.0)
-        total_count = int(dfp["total_count"].sum())
-        completed_count = int(dfp["completed_count"].sum())
-        overall = percent_value(completed_count, total_count)
-        last_day = str(dfp["updated_at"].max())[:10] if "updated_at" in dfp.columns else "-"
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("自分の全体進捗", f"{overall:.1f}%")
-        c2.metric("記録項目", len(dfp))
-        c3.metric("完了/正解", f"{completed_count} / {total_count}")
-        c4.metric("最終学習", last_day or "-")
-
-        st.markdown("### 最近勉強した内容")
-        for _, row in dfp.sort_values("updated_at", ascending=False).head(5).iterrows():
-            rate = float(row.get("score_rate") or 0)
-            st.progress(min(1.0, max(0.0, rate / 100)))
-            st.write(
-                f"**{row.get('title', '')}**  "
-                f"{int(row.get('completed_count') or 0)} / {int(row.get('total_count') or 0)} "
-                f"（{rate:.1f}%） / {row.get('status', '')}"
-            )
-
-        area_df = dfp.groupby("area", as_index=False).agg(
-            total_count=("total_count", "sum"),
-            completed_count=("completed_count", "sum"),
-            records=("item_key", "count"),
-        )
-        area_df["進捗率%"] = area_df.apply(lambda r: percent_value(r["completed_count"], r["total_count"]), axis=1).round(1)
-        area_df = area_df.rename(columns={"area": "分野", "total_count": "合計", "completed_count": "完了/正解", "records": "記録数"})
-        st.markdown("### 分野別の自分の進捗")
-        st.dataframe(area_df[["分野", "進捗率%", "完了/正解", "合計", "記録数"]], use_container_width=True, hide_index=True)
-
-    st.markdown("### 前回の学習場所")
-    last_rows = []
-    try:
-        app_progress = load_user_progress("app", {})
-        passitan_progress = load_user_progress("passitan", {})
-        passitan_test_progress = load_user_progress("passitan_test", {})
-        special_progress = load_user_progress("special_lesson", {})
-        if app_progress.get("last_page"):
-            last_rows.append({"項目": "前回開いた画面", "内容": app_progress.get("last_page", "")})
-        if passitan_progress:
-            last_rows.append({"項目": "パス単", "内容": f"{passitan_progress.get('selected_grade','')} / {passitan_progress.get('section_label') or passitan_progress.get('start_no','')} / {passitan_progress.get('view_mode','')}"})
-        if passitan_test_progress:
-            last_rows.append({"項目": "パス単テスト", "内容": f"{passitan_test_progress.get('selected_grade','')} / {passitan_test_progress.get('scope_label','')} / {passitan_test_progress.get('selected_count','')}"})
-        if special_progress:
-            last_rows.append({"項目": "special-lesson", "内容": f"Unit: {special_progress.get('selected_unit','')} / Type: {special_progress.get('selected_qtype','')} / {special_progress.get('count_label','')}"})
-    except Exception:
-        last_rows = []
-    if last_rows:
-        st.dataframe(pd.DataFrame(last_rows), use_container_width=True, hide_index=True)
-    else:
-        st.caption("前回の場所はまだ保存されていません。")
-
-    if not events_df.empty:
-        ev = events_df.copy()
-        ev["score_rate"] = pd.to_numeric(ev["score_rate"], errors="coerce").fillna(0).round(1)
-        ev = ev.rename(columns={"area": "分野", "event_type": "種類", "title": "内容", "total_count": "問題数", "completed_count": "正解/完了", "score_rate": "正解率%", "created_at": "日時"})
-        st.markdown("### 自分の最近のテスト履歴")
-        st.dataframe(ev[["分野", "種類", "内容", "問題数", "正解/完了", "正解率%", "日時"]].head(10), use_container_width=True, hide_index=True)
-
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
 def overview(df):
     render_hero(df)
-    render_my_study_overview_visible()
-    render_all_user_ranking_overview()
     st.subheader("📊 収録データ")
     col1, col2 = st.columns([1.1, 1])
     with col1:
@@ -1842,45 +2256,79 @@ def overview(df):
         st.write("1. 試験問題で文章・訳・選択肢を確認")
         st.write("2. Quizで答えを選ぶ")
         st.write("3. 類義語をまとめて覚える")
-        st.write("4. パス単・テスト・special-lessonの学習記録はOverviewと学習記録に自動表示")
+        st.write("4. 新しい問題は『問題を追加』から登録")
         st.markdown('</div>', unsafe_allow_html=True)
     st.subheader("🔥 最近の重要語")
-    if df.empty:
-        st.info("問題データがありません。")
-    else:
-        sample = df[["exam", "qno", "correct_word", "synonyms"]].tail(12).sort_values(["exam", "qno"])
-        st.dataframe(sample, use_container_width=True, hide_index=True)
+    sample = df[["exam", "qno", "correct_word", "synonyms"]].tail(12).sort_values(["exam", "qno"])
+    st.dataframe(sample, use_container_width=True, hide_index=True)
 
 
-def list_page(df, submenu="Vocabulary"):
-    st.subheader(f"📚 試験問題 / {submenu}")
+def list_page(df, submenu="Vocabulary", selected_grade="英検準1級"):
+    st.subheader(f"📚 試験問題 / {selected_grade} / {submenu}")
+
+    target_df = df.copy()
+
+    if "question_grade_label" in target_df.columns and selected_grade:
+        target_df = target_df[target_df["question_grade_label"] == selected_grade]
+
+    if "question_category" in target_df.columns and submenu:
+        target_df = target_df[target_df["question_category"] == submenu]
+    elif "tags" in target_df.columns and submenu == "Reading":
+        target_df = target_df[target_df["tags"].astype(str).str.contains("Reading|読解|リーディング|長文", case=False, na=False)]
+    elif "tags" in target_df.columns and submenu == "Grammar":
+        target_df = target_df[target_df["tags"].astype(str).str.contains("Grammar|文法|グラマー|語法", case=False, na=False)]
 
     if submenu == "Vocabulary":
         st.caption("語彙問題の文章、日本語訳、正解、選択肢解析、類義語をカード形式で確認できます。")
-        target_df = df
     elif submenu == "Reading":
-        st.caption("Reading問題をここに表示します。現在のDBにReading問題がある場合は、tagsに Reading を入れると表示できます。")
-        if "tags" in df.columns:
-            target_df = df[df["tags"].astype(str).str.contains("Reading|読解|リーディング", case=False, na=False)]
-        else:
-            target_df = df.iloc[0:0]
+        st.caption("Reading問題を表示します。tagsに Reading / 読解 / リーディング / 長文 が入っている問題が対象です。")
     elif submenu == "Grammar":
-        st.caption("Grammar問題をここに表示します。現在のDBにGrammar問題がある場合は、tagsに Grammar を入れると表示できます。")
-        if "tags" in df.columns:
-            target_df = df[df["tags"].astype(str).str.contains("Grammar|文法|グラマー", case=False, na=False)]
-        else:
-            target_df = df.iloc[0:0]
-    else:
-        target_df = df
+        st.caption("Grammar問題を表示します。tagsに Grammar / 文法 / グラマー / 語法 が入っている問題が対象です。")
+
+    if not target_df.empty:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("級", selected_grade)
+        c2.metric("カテゴリ", submenu)
+        c3.metric("問題数", len(target_df))
+
+    passitan_index = {}
+    highlight_passitan = submenu == "Vocabulary"
+    if highlight_passitan:
+        passitan_index = build_passitan_word_index()
+        st.markdown(
+            """
+            <style>
+            .passitan-hit {
+                color: #32d583 !important;
+                font-weight: 900;
+                text-decoration: underline;
+                text-decoration-thickness: 2px;
+                cursor: pointer;
+                text-underline-offset: 3px;
+                background: rgba(50, 213, 131, .12);
+                border-radius: 6px;
+                padding: 0 4px;
+            }
+            .passitan-hit:hover { background: rgba(50, 213, 131, .24); }
+            .choice-line { color: #ffffff; font-size: 22px; line-height: 1.85; font-weight: 700; }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+        if passitan_index:
+            st.caption("緑色の単語はパス単に登録済みです。単語をクリックすると、再ログインなしでパス単へ移動します。")
 
     show = st.toggle("答えと解説を表示", value=False)
 
     if target_df.empty:
-        st.info(f"{submenu} の問題データはまだありません。『問題を追加』画面でtagsに {submenu} を入れると、このサブメニューに表示できます。")
+        st.info(
+            f"{selected_grade} / {submenu} の問題データはまだありません。"
+            f"『問題を追加』画面で Grade と Category を選択するか、tagsに {submenu} を入れると表示できます。"
+        )
         return
 
     for _, row in target_df.iterrows():
-        render_card(row, show_answer=show)
+        render_card(row, show_answer=show, passitan_index=passitan_index, highlight_passitan=highlight_passitan)
 
 
 def quiz_page(df):
@@ -2222,6 +2670,331 @@ def render_browser_speak_button(word, key, label="🔊", height=34):
         height=height,
     )
 
+
+def connect_toefl_kmf_word_db():
+    return sqlite3.connect(TOEFL_KMF_WORD_DB_PATH, check_same_thread=False)
+
+
+def load_toefl_kmf_words():
+    """toefl_kmf_words.db から KMF TOEFL 単語を読み込みます。"""
+    db_path = next((p for p in TOEFL_KMF_WORD_DB_CANDIDATES if p.exists()), None)
+    if db_path is None:
+        return pd.DataFrame(), "DBが見つかりません: toefl_kmf_words.db を app.py と同じフォルダに置いてください。"
+
+    try:
+        con = sqlite3.connect(db_path, check_same_thread=False)
+        cur = con.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='kmf_words'")
+        if cur.fetchone() is None:
+            con.close()
+            return pd.DataFrame(), f"TOEFL-KMF-word DBに kmf_words テーブルがありません: {db_path.name}"
+
+        cur.execute("PRAGMA table_info(kmf_words)")
+        existing_cols = {row[1] for row in cur.fetchall()}
+        required_cols = {"global_order", "source_type", "list_no", "section", "word", "meaning_jp"}
+        missing = sorted(required_cols - existing_cols)
+        if missing:
+            con.close()
+            return pd.DataFrame(), f"TOEFL-KMF-word DBの kmf_words テーブルに必要な列がありません: {', '.join(missing)}"
+
+        word_index_expr = "word_index" if "word_index" in existing_cols else "`index` AS word_index"
+        phonetic_expr = "phonetic" if "phonetic" in existing_cols else "'' AS phonetic"
+        example1_expr = "example1_en" if "example1_en" in existing_cols else "'' AS example1_en"
+        example2_expr = "example2_en" if "example2_en" in existing_cols else "'' AS example2_en"
+        known_expr = "known" if "known" in existing_cols else "0 AS known"
+        note_expr = "note" if "note" in existing_cols else "'' AS note"
+        id_expr = "id" if "id" in existing_cols else "rowid AS id"
+        df = pd.read_sql_query(
+            f"""
+            SELECT {id_expr}, global_order, source_type, list_no, section, {word_index_expr},
+                   word, {phonetic_expr}, meaning_jp, {example1_expr}, {example2_expr},
+                   {known_expr}, {note_expr}
+            FROM kmf_words
+            ORDER BY global_order
+            """,
+            con,
+        )
+        con.close()
+    except Exception as e:
+        return pd.DataFrame(), f"TOEFL-KMF-word DBの読み込みに失敗しました: {e}"
+
+    if df.empty:
+        return df, "TOEFL-KMF-word のデータがありません。"
+
+    for col in ["source_type", "word", "phonetic", "meaning_jp", "example1_en", "example2_en", "note"]:
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].fillna("").astype(str)
+    for col in ["id", "global_order", "list_no", "section", "word_index", "known"]:
+        if col not in df.columns:
+            df[col] = 0
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+    df["source_db"] = str(db_path.name)
+    return df, ""
+
+
+def update_toefl_kmf_known(row_id, known):
+    con = connect_toefl_kmf_word_db()
+    con.execute(
+        "UPDATE kmf_words SET known=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+        (1 if known else 0, int(row_id)),
+    )
+    con.commit()
+    con.close()
+
+
+def toefl_kmf_source_label(source_type):
+    src = str(source_type or "").strip().lower()
+    if src == "core":
+        return "Core Vocabulary"
+    if src == "listening":
+        return "Listening Vocabulary"
+    return str(source_type or "その他")
+
+
+def toefl_kmf_word_page():
+    st.subheader("📙 TOEFL-KMF-word")
+    st.caption("kmf_toefl_words_list_meaning_jp.csv から作成したDBを読み込み、パス単と同じように単語・日本語意味・例文・Known・単語帳登録を表示します。")
+
+    kmf_df, err = load_toefl_kmf_words()
+    if err:
+        st.warning(err)
+    if kmf_df.empty:
+        return
+
+    kmf_df = kmf_df.copy()
+    kmf_df["source_label"] = kmf_df["source_type"].apply(toefl_kmf_source_label)
+
+    total = len(kmf_df)
+    known_count = int(kmf_df["known"].fillna(0).astype(int).sum())
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("登録単語数", total)
+    c2.metric("わかった単語", known_count)
+    c3.metric("未チェック", total - known_count)
+    c4.metric("DB", str(kmf_df["source_db"].iloc[0]) if "source_db" in kmf_df.columns else "-")
+
+    st.markdown(
+        """
+        <style>
+        .kmf-card {
+            padding: 12px 14px;
+            border-radius: 16px;
+            background: rgba(255,255,255,.045);
+            border: 1px solid rgba(255,255,255,.18);
+            margin: 0 0 10px 0;
+        }
+        .kmf-top { display:flex; align-items:center; gap:8px; margin-bottom: 6px; flex-wrap: wrap; }
+        .kmf-no {
+            display:inline-flex; align-items:center; justify-content:center;
+            min-width: 46px; height:24px; border-radius:999px;
+            background: rgba(255,255,255,.12); color:#dce8fb;
+            font-size:12px; font-weight:850;
+        }
+        .kmf-tag {
+            display:inline-flex; align-items:center; justify-content:center;
+            min-width: 70px; height:24px; border-radius:999px;
+            background: rgba(79,172,254,.15); color:#cfe8ff;
+            font-size:12px; font-weight:800; padding: 0 9px;
+        }
+        .kmf-word { color:#ffffff; font-size:22px; font-weight:900; line-height:1.2; overflow-wrap:anywhere; }
+        .kmf-phonetic { color:#aebbd0; font-size:14px; font-weight:700; }
+        .kmf-meaning { color:#b7ffcf; font-size:15px; line-height:1.55; margin: 4px 0 8px 0; }
+        .kmf-example { color:#d7e2f5; font-size:19px; line-height:1.55; margin: 4px 0; overflow-wrap:anywhere; }
+        .kmf-table-header, .kmf-cell {
+            box-sizing:border-box; min-height:44px; padding:5px 6px; margin:0;
+            display:flex; align-items:center; overflow:hidden;
+            border-left: 1px solid rgba(255,255,255,.24);
+            border-bottom: 1px solid rgba(255,255,255,.20);
+            border-radius:0;
+        }
+        .kmf-table-header { background:rgba(255,255,255,.16); border-top:1px solid rgba(255,255,255,.40); font-weight:850; color:#eef4ff; }
+        .kmf-cell { background:rgba(255,255,255,.035); }
+        .kmf-center { justify-content:center; text-align:center; }
+        .kmf-table-word { font-size:16px; font-weight:900; color:#fff; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .kmf-table-meaning { color:#b7ffcf; font-size:12px; line-height:1.3; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .kmf-table-example { width:100%; color:#d7e2f5; font-size:16px; line-height:1.35; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        div[data-testid="stHorizontalBlock"]:has(.kmf-table-row) { gap: 0 !important; }
+        div[data-testid="stHorizontalBlock"]:has(.kmf-table-row) > div[data-testid="column"] { padding: 0 !important; }
+        div[data-testid="stHorizontalBlock"]:has(.kmf-table-row) div[data-testid="element-container"] { margin: 0 !important; padding: 0 !important; }
+        div[data-testid="stHorizontalBlock"]:has(.kmf-table-row) div[data-testid="stCheckbox"] { display:flex !important; justify-content:center !important; align-items:center !important; min-height:34px !important; }
+        div[data-testid="stHorizontalBlock"]:has(.kmf-table-row) div[data-testid="stCheckbox"] p { display:none !important; }
+        div[data-testid="stHorizontalBlock"]:has(.kmf-table-row) div[data-testid="stButton"] { display:flex !important; justify-content:center !important; align-items:center !important; min-height:34px !important; }
+        div[data-testid="stHorizontalBlock"]:has(.kmf-table-row) div[data-testid="stButton"] > button {
+            width:58px !important; min-width:58px !important; height:26px !important; min-height:26px !important;
+            padding:0 6px !important; border-radius:6px !important; font-size:12px !important;
+            background:transparent !important; background-image:none !important; color:#eef4ff !important;
+            border:1px solid rgba(255,255,255,.45) !important; box-shadow:none !important;
+        }
+        @media (max-width: 768px) {
+            .kmf-word { font-size:20px; }
+            .kmf-example { font-size:18px; }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    source_options = ["すべて"] + sorted(kmf_df["source_label"].dropna().astype(str).unique().tolist())
+    c_source, c_list, c_section, c_keyword, c_flags = st.columns([1.3, 1.0, 1.0, 2.0, 1.1])
+    with c_source:
+        selected_source = st.selectbox("Source", source_options, index=0, key="kmf_source_select")
+    temp_df = kmf_df.copy()
+    if selected_source != "すべて":
+        temp_df = temp_df[temp_df["source_label"] == selected_source]
+    list_options = ["すべて"] + [str(x) for x in sorted(temp_df["list_no"].dropna().astype(int).unique().tolist())]
+    with c_list:
+        selected_list = st.selectbox("List", list_options, index=0, key="kmf_list_select")
+    temp_df2 = temp_df.copy()
+    if selected_list != "すべて":
+        temp_df2 = temp_df2[temp_df2["list_no"] == int(selected_list)]
+    section_options = ["すべて"] + [str(x) for x in sorted(temp_df2["section"].dropna().astype(int).unique().tolist())]
+    with c_section:
+        selected_section = st.selectbox("Section", section_options, index=0, key="kmf_section_select")
+    with c_keyword:
+        keyword = st.text_input("検索", placeholder="例: abandon / 捨てる / academic", key="kmf_keyword")
+    with c_flags:
+        hide_known = st.checkbox("Knownを隠す", value=False, key="kmf_hide_known")
+        view_mode = st.radio("表示", ["スマホカード", "PC表"], index=0, key="kmf_view_mode")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    view = kmf_df.copy()
+    if selected_source != "すべて":
+        view = view[view["source_label"] == selected_source]
+    if selected_list != "すべて":
+        view = view[view["list_no"] == int(selected_list)]
+    if selected_section != "すべて":
+        view = view[view["section"] == int(selected_section)]
+    if keyword:
+        k = keyword.lower().strip()
+        view = view[
+            view["word"].astype(str).str.lower().str.contains(k, na=False)
+            | view["meaning_jp"].astype(str).str.lower().str.contains(k, na=False)
+            | view["phonetic"].astype(str).str.lower().str.contains(k, na=False)
+            | view["example1_en"].astype(str).str.lower().str.contains(k, na=False)
+            | view["example2_en"].astype(str).str.lower().str.contains(k, na=False)
+        ]
+    if hide_known:
+        view = view[view["known"].fillna(0).astype(int) == 0]
+    view = view.sort_values("global_order")
+
+    c_view, c_page = st.columns([1.3, 2.0])
+    with c_view:
+        display_n = st.selectbox("表示件数", [10, 20, 50, 100], index=2, key="kmf_display_n")
+    total_view = len(view)
+    max_page = max(1, (total_view + int(display_n) - 1) // int(display_n))
+    with c_page:
+        page_no = st.number_input("ページ", min_value=1, max_value=max_page, value=min(int(st.session_state.get("kmf_page_no", 1)), max_page), step=1, key="kmf_page_no")
+    start = (int(page_no) - 1) * int(display_n)
+    page_df = view.iloc[start:start + int(display_n)].copy()
+
+    st.info(f"表示: {len(page_df)} / {total_view}語（ページ {page_no}/{max_page}）")
+    export_cols = ["global_order", "source_type", "list_no", "section", "word_index", "word", "phonetic", "meaning_jp", "example1_en", "example2_en", "known"]
+    st.download_button(
+        "TOEFL-KMF-word CSVをダウンロード",
+        view[export_cols].to_csv(index=False).encode("utf-8-sig"),
+        file_name="toefl_kmf_words_export.csv",
+        mime="text/csv",
+    )
+
+    if page_df.empty:
+        st.info("この条件で表示できる単語がありません。")
+        return
+
+    if view_mode == "スマホカード":
+        for _, row in page_df.iterrows():
+            row_id = int(row["id"])
+            global_order = int(row.get("global_order", 0))
+            word = str(row.get("word", ""))
+            phonetic = str(row.get("phonetic", ""))
+            meaning = str(row.get("meaning_jp", ""))
+            ex1 = str(row.get("example1_en", ""))
+            ex2 = str(row.get("example2_en", ""))
+            is_known = bool(int(row.get("known") or 0))
+            tag = f"{row.get('source_label', '')} / List {int(row.get('list_no', 0))} / Sec {int(row.get('section', 0))}"
+            st.markdown(
+                f"""
+                <div class="kmf-card">
+                  <div class="kmf-top">
+                    <span class="kmf-no">No.{global_order}</span>
+                    <span class="kmf-tag">{html.escape(tag)}</span>
+                    <span class="kmf-word">{html.escape(word)}</span>
+                    <span class="kmf-phonetic">/{html.escape(phonetic)}/</span>
+                  </div>
+                  <div class="kmf-meaning">{html.escape(meaning)}</div>
+                  <div class="kmf-example">1. {html.escape(ex1)}</div>
+                  <div class="kmf-example">2. {html.escape(ex2)}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            a0, a1, a2 = st.columns([0.8, 1, 1])
+            with a0:
+                render_browser_speak_button(word, key=f"kmf_card_{row_id}", label="🔊", height=36)
+            with a1:
+                checked = st.checkbox("Known", value=is_known, key=f"kmf_known_card_{row_id}")
+                if checked != is_known:
+                    update_toefl_kmf_known(row_id, checked)
+                    st.rerun()
+            with a2:
+                if st.button("登録", key=f"kmf_add_vocab_card_{row_id}", use_container_width=True):
+                    ok, msg = add_vocab_word(
+                        word,
+                        meaning=meaning,
+                        japanese_translation=meaning,
+                        explanation="TOEFL-KMF-word から登録",
+                        example_sentence=ex1 or ex2,
+                        note=f"TOEFL-KMF-word / {tag}",
+                    )
+                    st.success(msg) if ok else st.error(msg)
+    else:
+        h_no, h_word, h_speak, h_meaning, h_example, h_known, h_add = st.columns([0.5, 1.25, 0.52, 2.2, 4.2, 0.72, 0.8], gap=None)
+        h_no.markdown('<div class="kmf-table-header kmf-center kmf-table-row">No.</div>', unsafe_allow_html=True)
+        h_word.markdown('<div class="kmf-table-header kmf-table-row">英単語</div>', unsafe_allow_html=True)
+        h_speak.markdown('<div class="kmf-table-header kmf-center kmf-table-row">音声</div>', unsafe_allow_html=True)
+        h_meaning.markdown('<div class="kmf-table-header kmf-table-row">日本語意味</div>', unsafe_allow_html=True)
+        h_example.markdown('<div class="kmf-table-header kmf-table-row">例文</div>', unsafe_allow_html=True)
+        h_known.markdown('<div class="kmf-table-header kmf-center kmf-table-row">Known</div>', unsafe_allow_html=True)
+        h_add.markdown('<div class="kmf-table-header kmf-center kmf-table-row">単語帳</div>', unsafe_allow_html=True)
+        for _, row in page_df.iterrows():
+            row_id = int(row["id"])
+            global_order = int(row.get("global_order", 0))
+            word = str(row.get("word", ""))
+            phonetic = str(row.get("phonetic", ""))
+            meaning = str(row.get("meaning_jp", ""))
+            ex1 = str(row.get("example1_en", ""))
+            ex2 = str(row.get("example2_en", ""))
+            is_known = bool(int(row.get("known") or 0))
+            c_no, c_word, c_speak, c_meaning, c_example, c_known, c_add = st.columns([0.5, 1.25, 0.52, 2.2, 4.2, 0.72, 0.8], gap=None)
+            with c_no:
+                st.markdown(f'<div class="kmf-cell kmf-center kmf-table-row"><b>{global_order}</b></div>', unsafe_allow_html=True)
+            with c_word:
+                st.markdown(f'<div class="kmf-cell kmf-table-row"><div><div class="kmf-table-word">{html.escape(word)}</div><div class="kmf-table-meaning">/{html.escape(phonetic)}/</div></div></div>', unsafe_allow_html=True)
+            with c_speak:
+                st.markdown('<div class="kmf-table-row"></div>', unsafe_allow_html=True)
+                render_browser_speak_button(word, key=f"kmf_table_{row_id}", label="🔊", height=34)
+            with c_meaning:
+                st.markdown(f'<div class="kmf-cell kmf-table-row"><div class="kmf-table-meaning" title="{html.escape(meaning)}">{html.escape(meaning)}</div></div>', unsafe_allow_html=True)
+            with c_example:
+                example_text = ex1 if not ex2 else f"{ex1} / {ex2}"
+                st.markdown(f'<div class="kmf-cell kmf-table-row"><div class="kmf-table-example" title="{html.escape(example_text)}">{html.escape(example_text)}</div></div>', unsafe_allow_html=True)
+            with c_known:
+                checked = st.checkbox(" ", value=is_known, key=f"kmf_known_table_{row_id}", label_visibility="collapsed")
+                if checked != is_known:
+                    update_toefl_kmf_known(row_id, checked)
+                    st.rerun()
+            with c_add:
+                if st.button("登録", key=f"kmf_add_vocab_table_{row_id}"):
+                    ok, msg = add_vocab_word(
+                        word,
+                        meaning=meaning,
+                        japanese_translation=meaning,
+                        explanation="TOEFL-KMF-word から登録",
+                        example_sentence=ex1 or ex2,
+                        note=f"TOEFL-KMF-word / {row.get('source_label', '')} / List {int(row.get('list_no', 0))} / Sec {int(row.get('section', 0))}",
+                    )
+                    st.success(msg) if ok else st.error(msg)
+
 def passitan_page():
     st.subheader("📗 パス単")
     st.caption("英検準1級・英検1級を切り替えて学習できます。スマホではカード表示、PCでは表表示を選べます。🔊ボタンでブラウザ音声読み上げができます。")
@@ -2246,12 +3019,13 @@ def passitan_page():
     existing_labels = passitan_all_df["grade_label"].dropna().astype(str).unique().tolist()
     grade_options = [x for x in preferred if x in existing_labels] + [x for x in existing_labels if x not in preferred]
 
-    progress = load_user_progress("passitan", {})
-    set_session_default_from_progress("passitan_grade_select", progress.get("selected_grade"), grade_options)
+    jump_grade = st.session_state.pop("passitan_jump_grade", "") if st.session_state.get("passitan_jump_grade") else ""
+    jump_word = st.session_state.pop("passitan_jump_word", "") if st.session_state.get("passitan_jump_word") else ""
+    if jump_grade and jump_grade in grade_options:
+        st.session_state["passitan_grade_select"] = jump_grade
 
     st.markdown('<div class="card">', unsafe_allow_html=True)
     selected_grade = st.selectbox("教材を選択", grade_options, index=0, key="passitan_grade_select")
-    st.caption("前回の教材・Section・開始No・表示形式を自動で復元します。")
     st.markdown('</div>', unsafe_allow_html=True)
 
     passitan_df = passitan_all_df[passitan_all_df["grade_label"] == selected_grade].copy()
@@ -2281,28 +3055,12 @@ def passitan_page():
     display_n = 100 if is_pre1_passitan else 50
     section_key = f"passitan_section_{grade_slug}"
     start_key = f"passitan_start_no_{grade_slug}"
-    display_n_key = f"display_n_{grade_slug}"
-    keyword_key = f"passitan_keyword_{grade_slug}"
-    hide_known_key = f"hide_known_{grade_slug}"
-    view_mode_key = f"view_mode_{grade_slug}"
-
-    set_session_default_from_progress(display_n_key, progress.get("display_n"), [10, 20, 50])
-    set_session_default_from_progress(keyword_key, progress.get("keyword"))
-    set_session_default_from_progress(hide_known_key, progress.get("hide_known"), [True, False])
-    set_session_default_from_progress(view_mode_key, progress.get("view_mode"), ["スマホカード", "PC表"])
-    try:
-        saved_start_no = int(progress.get("start_no"))
-    except Exception:
-        saved_start_no = None
-    if saved_start_no is not None:
-        set_session_default_from_progress(start_key, saved_start_no)
 
     if is_pre1_passitan:
         sections = build_passitan_sections(max_passitan_no, section_size=100, fixed_count=19)
-        valid_section_labels = [sec["label"] for sec in sections]
-        set_session_default_from_progress(section_key, progress.get("section_label"), valid_section_labels)
         if section_key not in st.session_state:
             st.session_state[section_key] = sections[0]["label"]
+        valid_section_labels = [sec["label"] for sec in sections]
         if st.session_state[section_key] not in valid_section_labels:
             st.session_state[section_key] = valid_section_labels[0]
 
@@ -2317,23 +3075,26 @@ def passitan_page():
         start_no = int(selected_section["start"])
         end_no = int(selected_section["end"])
         with col_b:
+            keyword_key = f"passitan_keyword_{grade_slug}"
+            if jump_word:
+                st.session_state[keyword_key] = str(jump_word)
             keyword = st.text_input("検索", placeholder="例: affect / 影響", key=keyword_key)
         with col_c:
-            hide_known = st.checkbox("わかった単語を隠す", value=False, key=hide_known_key)
+            hide_known = st.checkbox("わかった単語を隠す", value=False, key=f"hide_known_{grade_slug}")
         with col_d:
             view_mode = st.radio(
                 "表示形式",
                 ["スマホカード", "PC表"],
                 index=0,
                 horizontal=False,
-                key=view_mode_key,
+                key=f"view_mode_{grade_slug}",
                 help="携帯電話では『スマホカード』を使うと表崩れを防げます。",
             )
         st.info(f"{selected_section_label} を表示します。範囲: No.{start_no}〜No.{end_no}（100語）")
     else:
         col_a, col_b, col_c, col_d, col_e = st.columns([1, 1, 2, 1, 1.2])
         with col_a:
-            display_n = st.selectbox("表示件数", [10, 20, 50], index=2, key=display_n_key)
+            display_n = st.selectbox("表示件数", [10, 20, 50], index=2, key=f"display_n_{grade_slug}")
         with col_b:
             if start_key not in st.session_state:
                 st.session_state[start_key] = 1
@@ -2349,28 +3110,21 @@ def passitan_page():
                 key=start_key,
             )
         with col_c:
+            keyword_key = f"passitan_keyword_{grade_slug}"
+            if jump_word:
+                st.session_state[keyword_key] = str(jump_word)
             keyword = st.text_input("検索", placeholder="例: affect / 影響", key=keyword_key)
         with col_d:
-            hide_known = st.checkbox("わかった単語を隠す", value=False, key=hide_known_key)
+            hide_known = st.checkbox("わかった単語を隠す", value=False, key=f"hide_known_{grade_slug}")
         with col_e:
             view_mode = st.radio(
                 "表示形式",
                 ["スマホカード", "PC表"],
                 index=0,
                 horizontal=False,
-                key=view_mode_key,
+                key=f"view_mode_{grade_slug}",
                 help="携帯電話では『スマホカード』を使うと表崩れを防げます。",
             )
-    save_user_progress("passitan", {
-        "selected_grade": selected_grade,
-        "section_label": selected_section_label if is_pre1_passitan else "",
-        "start_no": int(start_no),
-        "end_no": int(end_no),
-        "display_n": int(display_n) if not is_pre1_passitan else 100,
-        "keyword": keyword,
-        "hide_known": bool(hide_known),
-        "view_mode": view_mode,
-    })
     st.markdown('</div>', unsafe_allow_html=True)
 
     view = passitan_df.copy()
@@ -2391,21 +3145,10 @@ def passitan_page():
     if not is_pre1_passitan:
         view = view.head(display_n)
 
-    # 現在表示中の範囲を学習記録に保存します。
-    range_total = int(len(view))
-    range_known = int(view["known"].fillna(0).astype(int).sum()) if not view.empty else 0
-    progress_title = f"{selected_grade} {selected_section_label if is_pre1_passitan else f'No.{int(start_no)}〜'}"
-    save_study_progress(
-        area="パス単",
-        item_key=f"{selected_grade}_{int(start_no)}_{int(end_no) if is_pre1_passitan else int(start_no) + int(display_n) - 1}",
-        title=progress_title,
-        unit=selected_grade,
-        section_no=selected_section_label if is_pre1_passitan else str(start_no),
-        total_count=range_total,
-        completed_count=range_known,
-        status="完了" if range_total and range_known >= range_total else "学習中",
-        payload={"start_no": int(start_no), "end_no": int(end_no) if is_pre1_passitan else int(start_no) + int(display_n) - 1},
-    )
+    if jump_word:
+        st.success(f"パス単で '{jump_word}' を表示しています。検索欄を空にすると通常表示に戻ります。")
+        st.session_state.pop("passitan_jump_word", None)
+        st.session_state.pop("passitan_jump_no", None)
 
     st.download_button(
         f"{selected_grade} CSVをダウンロード",
@@ -2461,6 +3204,41 @@ def passitan_page():
             line-height: 1.35;
             margin: 0 0 6px 0;
         }
+        .passitan-related-box {
+            margin: 6px 0 8px 0;
+            padding: 8px 10px;
+            border-radius: 12px;
+            background: rgba(255,231,163,.08);
+            border: 1px solid rgba(255,231,163,.18);
+        }
+        .passitan-related-line {
+            color: #ffe7a3;
+            font-size: 12.5px;
+            line-height: 1.45;
+            margin: 2px 0;
+            overflow-wrap: anywhere;
+        }
+        .passitan-related-label {
+            display: inline-block;
+            min-width: 64px;
+            color: #ffffff;
+            font-weight: 850;
+        }
+        .passitan-word-cell-wrap {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            width: 100%;
+            min-width: 0;
+        }
+        .passitan-word-meaning {
+            color: #b7ffcf;
+            font-size: 11.5px;
+            line-height: 1.3;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
         .passitan-card-example {
             color: #d7e2f5;
             font-size: 20px !important;
@@ -2471,8 +3249,8 @@ def passitan_page():
         .passitan-table-header,
         .passitan-cell {
             box-sizing: border-box;
-            min-height: 34px;
-            padding: 4px 6px;
+            min-height: 44px;
+            padding: 5px 6px;
             margin: 0;
             display: flex;
             align-items: center;
@@ -2563,6 +3341,9 @@ def passitan_page():
         st.info("表示する単語がありません。")
         return
 
+    # パス単の各単語に、同義語・反対語・発音が近い・品詞派生・熟語を表示するための索引
+    vocab_strategy_index = build_vocab_strategy_index(build_vocab_strategy_groups(max_each=200))
+
     if view_mode == "スマホカード":
         for _, row in view.iterrows():
             row_id = int(row["id"])
@@ -2574,6 +3355,7 @@ def passitan_page():
 
             safe_word = html.escape(word)
             safe_meaning = html.escape(meaning)
+            related_html = render_vocab_strategy_items_html(word, strategy_index=vocab_strategy_index, compact=False)
 
             # hint_example = make_example_with_word_hint(example, word, hint_len=2)
             safe_example = html.escape(example)
@@ -2586,6 +3368,7 @@ def passitan_page():
                     <span class="passitan-card-word" title="{safe_meaning}">{safe_word}</span>
                   </div>
                   <p class="passitan-card-meaning">{safe_meaning}</p>
+                  {related_html}
                   <p class="passitan-card-example">{safe_example}</p>
                 </div>
                 """,
@@ -2633,6 +3416,7 @@ def passitan_page():
 
             safe_word = html.escape(word)
             safe_meaning = html.escape(meaning)
+            related_html = render_vocab_strategy_items_html(word, strategy_index=vocab_strategy_index, compact=True)
 
             hint_example = make_example_with_word_hint(example, word, hint_len=2)
             safe_example = html.escape(hint_example)
@@ -2641,7 +3425,14 @@ def passitan_page():
             with c_no:
                 st.markdown(f'<div class="passitan-cell passitan-cell-center passitan-table-row"><b>{no}</b></div>', unsafe_allow_html=True)
             with c_word:
-                st.markdown(f'<div class="passitan-cell passitan-table-row"><span class="passitan-word" title="{safe_meaning}">{safe_word}</span></div>', unsafe_allow_html=True)
+                st.markdown(
+                    f'<div class="passitan-cell passitan-table-row"><div class="passitan-word-cell-wrap">'
+                    f'<span class="passitan-word" title="{safe_meaning}">{safe_word}</span>'
+                    f'<span class="passitan-word-meaning">{safe_meaning}</span>'
+                    f'{related_html}'
+                    f'</div></div>',
+                    unsafe_allow_html=True,
+                )
             with c_speak:
                 st.markdown('<div class="passitan-table-row"></div>', unsafe_allow_html=True)
                 render_browser_speak_button(word, key=f"table_{row_id}", label="🔊", height=34)
@@ -2833,11 +3624,7 @@ def passitan_test_page():
     existing_labels = passitan_all_df["grade_label"].dropna().astype(str).unique().tolist()
     grade_options = [x for x in preferred if x in existing_labels] + [x for x in existing_labels if x not in preferred]
 
-    progress = load_user_progress("passitan_test", {})
-    set_session_default_from_progress("passitan_test_grade", progress.get("selected_grade"), grade_options)
-
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.caption("前回の教材・出題範囲・出題数・順番を自動で復元します。")
     c_grade, c_scope, c_count, c_mode = st.columns([1.2, 2.0, 1.2, 1.2])
     with c_grade:
         selected_grade = st.selectbox("教材を選択", grade_options, index=0, key="passitan_test_grade")
@@ -2850,21 +3637,8 @@ def passitan_test_page():
 
     scope_options = build_passitan_test_scope_options(passitan_df, selected_grade)
     scope_labels = [opt["label"] for opt in scope_options]
-    grade_slug = passitan_key_slug(selected_grade)
-    scope_key = f"passitan_test_scope_{grade_slug}"
-    count_key = f"passitan_test_count_{grade_slug}"
-    order_key = f"passitan_test_order_{grade_slug}"
-    audio_key = f"passitan_test_audio_{grade_slug}"
-    hint_key = f"passitan_test_hint_{grade_slug}"
-    hide_known_key = f"passitan_test_hide_known_{grade_slug}"
-    set_session_default_from_progress(scope_key, progress.get("scope_label"), scope_labels)
-    set_session_default_from_progress(count_key, progress.get("selected_count"), ["10問", "20問", "50問", "100問", "選択範囲すべて"])
-    set_session_default_from_progress(order_key, progress.get("order_mode"), ["順番通り", "シャッフル"])
-    set_session_default_from_progress(audio_key, progress.get("show_audio"), [True, False])
-    set_session_default_from_progress(hint_key, progress.get("show_example_hint"), [True, False])
-    set_session_default_from_progress(hide_known_key, progress.get("hide_known"), [True, False])
     with c_scope:
-        selected_scope_label = st.selectbox("出題範囲", scope_labels, index=1 if len(scope_labels) > 1 else 0, key=scope_key)
+        selected_scope_label = st.selectbox("出題範囲", scope_labels, index=1 if len(scope_labels) > 1 else 0, key=f"passitan_test_scope_{passitan_key_slug(selected_grade)}")
     selected_scope = next(opt for opt in scope_options if opt["label"] == selected_scope_label)
 
     scoped_df = passitan_df[
@@ -2874,26 +3648,17 @@ def passitan_test_page():
 
     with c_count:
         count_options = ["10問", "20問", "50問", "100問", "選択範囲すべて"]
-        selected_count = st.selectbox("出題数", count_options, index=1, key=count_key)
+        selected_count = st.selectbox("出題数", count_options, index=1, key=f"passitan_test_count_{passitan_key_slug(selected_grade)}")
     with c_mode:
-        order_mode = st.radio("順番", ["順番通り", "シャッフル"], index=0, key=order_key)
+        order_mode = st.radio("順番", ["順番通り", "シャッフル"], index=0, key=f"passitan_test_order_{passitan_key_slug(selected_grade)}")
 
     c_audio, c_hint, c_known = st.columns([1, 1.2, 1.2])
     with c_audio:
-        show_audio = st.checkbox("音声ボタンを表示", value=True, key=audio_key)
+        show_audio = st.checkbox("音声ボタンを表示", value=True, key=f"passitan_test_audio_{passitan_key_slug(selected_grade)}")
     with c_hint:
-        show_example_hint = st.checkbox("例文ヒントを表示（日本語なし）", value=True, key=hint_key)
+        show_example_hint = st.checkbox("例文ヒントを表示（日本語なし）", value=True, key=f"passitan_test_hint_{passitan_key_slug(selected_grade)}")
     with c_known:
-        hide_known = st.checkbox("Knownを除外", value=False, key=hide_known_key)
-    save_user_progress("passitan_test", {
-        "selected_grade": selected_grade,
-        "scope_label": selected_scope_label,
-        "selected_count": selected_count,
-        "order_mode": order_mode,
-        "show_audio": bool(show_audio),
-        "show_example_hint": bool(show_example_hint),
-        "hide_known": bool(hide_known),
-    })
+        hide_known = st.checkbox("Knownを除外", value=False, key=f"passitan_test_hide_known_{passitan_key_slug(selected_grade)}")
     st.markdown('</div>', unsafe_allow_html=True)
 
     if hide_known:
@@ -3040,27 +3805,6 @@ def passitan_test_page():
             })
 
         score_rate = correct_count / max(1, len(result_rows)) * 100
-        save_study_progress(
-            area="パス単テスト",
-            item_key=f"{selected_grade}_{selected_scope_label}",
-            title=f"{selected_grade} / {selected_scope_label}",
-            unit=selected_grade,
-            section_no=selected_scope_label,
-            total_count=len(result_rows),
-            completed_count=correct_count,
-            score_rate=score_rate,
-            status="合格" if score_rate >= 80 else "復習必要",
-            payload={"order_mode": order_mode, "selected_count": selected_count},
-        )
-        add_study_event(
-            area="パス単テスト",
-            event_type="check",
-            title=f"{selected_grade} / {selected_scope_label}",
-            total_count=len(result_rows),
-            completed_count=correct_count,
-            score_rate=score_rate,
-            payload={"selected_count": selected_count},
-        )
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown(f"### 結果: {correct_count} / {len(result_rows)} 問正解（{score_rate:.1f}%）")
         if correct_count == len(result_rows):
@@ -3128,33 +3872,18 @@ def special_lesson_page():
     if lesson_df.empty:
         return
 
-    progress = load_user_progress("special_lesson", {})
-    unit_options = ["すべて"] + sorted(lesson_df["unit"].dropna().unique().tolist())
-    qtype_options = ["すべて"] + sorted(lesson_df["qtype"].dropna().unique().tolist())
-    count_options = ["5問", "10問", "20問", "すべて"]
-    order_options = ["順番通り", "シャッフル"]
-    set_session_default_from_progress("special_lesson_unit", progress.get("selected_unit"), unit_options)
-    set_session_default_from_progress("special_lesson_qtype", progress.get("selected_qtype"), qtype_options)
-    set_session_default_from_progress("special_lesson_count", progress.get("count_label"), count_options)
-    set_session_default_from_progress("special_lesson_order", progress.get("order_mode"), order_options)
-
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.caption("前回のUnit・問題タイプ・出題数・順番を自動で復元します。")
     c_unit, c_type, c_count, c_order = st.columns([2.0, 1.3, 1.0, 1.1])
     with c_unit:
+        unit_options = ["すべて"] + sorted(lesson_df["unit"].dropna().unique().tolist())
         selected_unit = st.selectbox("Unit", unit_options, index=0, key="special_lesson_unit")
     with c_type:
+        qtype_options = ["すべて"] + sorted(lesson_df["qtype"].dropna().unique().tolist())
         selected_qtype = st.selectbox("問題タイプ", qtype_options, index=0, key="special_lesson_qtype")
     with c_count:
-        count_label = st.selectbox("出題数", count_options, index=1, key="special_lesson_count")
+        count_label = st.selectbox("出題数", ["5問", "10問", "20問", "すべて"], index=1, key="special_lesson_count")
     with c_order:
-        order_mode = st.radio("順番", order_options, index=0, key="special_lesson_order")
-    save_user_progress("special_lesson", {
-        "selected_unit": selected_unit,
-        "selected_qtype": selected_qtype,
-        "count_label": count_label,
-        "order_mode": order_mode,
-    })
+        order_mode = st.radio("順番", ["順番通り", "シャッフル"], index=0, key="special_lesson_order")
     st.markdown('</div>', unsafe_allow_html=True)
 
     view = lesson_df.copy()
@@ -3324,27 +4053,6 @@ def special_lesson_page():
             })
 
         score_rate = correct_count / max(1, len(result_rows)) * 100
-        save_study_progress(
-            area="special-lesson",
-            item_key=f"{selected_unit}_{selected_qtype}",
-            title=f"Unit: {selected_unit} / Type: {selected_qtype}",
-            unit=selected_unit,
-            section_no=selected_qtype,
-            total_count=len(result_rows),
-            completed_count=correct_count,
-            score_rate=score_rate,
-            status="合格" if score_rate >= 80 else "復習必要",
-            payload={"count_label": count_label, "order_mode": order_mode},
-        )
-        add_study_event(
-            area="special-lesson",
-            event_type="check",
-            title=f"Unit: {selected_unit} / Type: {selected_qtype}",
-            total_count=len(result_rows),
-            completed_count=correct_count,
-            score_rate=score_rate,
-            payload={"count_label": count_label},
-        )
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown(f"### 結果: {correct_count} / {len(result_rows)} 問正解（{score_rate:.1f}%）")
         if score_rate >= 80:
@@ -3356,94 +4064,848 @@ def special_lesson_page():
         st.dataframe(pd.DataFrame(result_rows), use_container_width=True, hide_index=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
-def study_records_page():
-    st.subheader("📈 学習記録")
-    st.caption("ユーザーごとに、前回どこまで学習したか・進捗率・テスト結果を保存して表示します。")
 
-    progress_df = load_study_progress()
-    events_df = load_study_events(limit=200)
+def parse_toefl_red_phrases(value):
+    """DBの red_phrases を表示用リストへ変換します。"""
+    value = str(value or "").strip()
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+        if isinstance(parsed, list):
+            return [str(x).strip() for x in parsed if str(x).strip()]
+    except Exception:
+        pass
+    # 現在のDBは "phrase | phrase" 形式。改行やカンマにも軽く対応します。
+    parts = []
+    for chunk in value.replace("\n", "|").split("|"):
+        chunk = chunk.strip()
+        if chunk:
+            parts.append(chunk)
+    return parts
 
-    if progress_df.empty:
-        st.info("まだ学習記録がありません。パス単・パス単テスト・special-lessonを使うと自動で記録されます。")
+
+
+def parse_toefl_red_phrase_jp_items(row):
+    """赤色フレーズの日本語説明を [{en, ja}] 形式にそろえます。"""
+    red_phrases = parse_toefl_red_phrases(row.get("red_phrases", ""))
+    jp_json = str(row.get("red_phrases_jp_json", "") or "").strip()
+    jp_text = str(row.get("red_phrases_jp", "") or "").strip()
+
+    items = []
+    if jp_json:
+        try:
+            parsed = json.loads(jp_json)
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if isinstance(item, dict):
+                        en = str(item.get("en", "") or "").strip()
+                        ja = str(item.get("ja", "") or "").strip()
+                        if en or ja:
+                            items.append({"en": en, "ja": ja})
+        except Exception:
+            items = []
+
+    if not items and jp_text:
+        for chunk in jp_text.replace("\n", "|").split("|"):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            if "：" in chunk:
+                en, ja = chunk.split("：", 1)
+            elif ":" in chunk:
+                en, ja = chunk.split(":", 1)
+            else:
+                en, ja = "", chunk
+            items.append({"en": en.strip(), "ja": ja.strip()})
+
+    normalized = []
+    for i, item in enumerate(items):
+        en = item.get("en", "") or (red_phrases[i] if i < len(red_phrases) else "")
+        ja = item.get("ja", "") or ""
+        if en or ja:
+            normalized.append({"en": str(en).strip(), "ja": str(ja).strip()})
+
+    if not normalized:
+        normalized = [{"en": p, "ja": ""} for p in red_phrases]
+    return normalized
+
+
+def _highlight_passitan_words_plain_segment(text, passitan_index):
+    """HTMLタグを含まない通常テキスト部分だけ、英検単語を緑色にします。"""
+    text = str(text or "")
+    pattern = _passitan_match_pattern(passitan_index)
+    if not text or pattern is None:
+        return html.escape(text)
+
+    out = []
+    pos = 0
+    for m in pattern.finditer(text):
+        out.append(html.escape(text[pos:m.start()]))
+        matched = m.group(0)
+        info = passitan_index.get(matched.lower())
+        if info:
+            title = f"{info.get('grade', 'パス単') or 'パス単'} No.{info.get('no', '')} / {info.get('meaning', '')}"
+            out.append(
+                f'<span class="toefl5600-eiken-hit" title="{html.escape(title)}">{html.escape(matched)}</span>'
+            )
+        else:
+            out.append(html.escape(matched))
+        pos = m.end()
+    out.append(html.escape(text[pos:]))
+    return "".join(out)
+
+
+def render_toefl_text_with_highlights(text, red_phrases, passitan_index=None):
+    """赤色フレーズを優先し、それ以外の英検1級・準1級単語を緑色にします。"""
+    import re
+
+    text = str(text or "")
+    red_phrases = [str(x or "").strip() for x in (red_phrases or []) if str(x or "").strip()]
+    passitan_index = passitan_index or {}
+    if not text:
+        return ""
+    if not red_phrases:
+        return _highlight_passitan_words_plain_segment(text, passitan_index)
+
+    phrase_pattern = re.compile("(" + "|".join(re.escape(p) for p in sorted(red_phrases, key=len, reverse=True)) + ")", re.IGNORECASE)
+    out = []
+    pos = 0
+    for m in phrase_pattern.finditer(text):
+        out.append(_highlight_passitan_words_plain_segment(text[pos:m.start()], passitan_index))
+        out.append('<mark class="toefl5600-red-hit">' + html.escape(m.group(0)) + '</mark>')
+        pos = m.end()
+    out.append(_highlight_passitan_words_plain_segment(text[pos:], passitan_index))
+    return "".join(out)
+
+
+def _toefl_table_columns(cur, table_name):
+    cur.execute(f"PRAGMA table_info({table_name})")
+    return {row[1] for row in cur.fetchall()}
+
+
+def infer_toefl_title(row):
+    """title列がない旧DBでも、本文内容から教材タイトルを推定します。"""
+    title = str(row.get("title", "") or "").strip()
+    if title and title != "TOEFL-5600":
+        return title
+
+    text_value = (
+        str(row.get("english_text", "") or "")
+        + " "
+        + str(row.get("highlighted_html", "") or "")
+        + " "
+        + str(row.get("red_phrases", "") or "")
+    ).lower()
+    try:
+        paragraph_no = int(row.get("paragraph_no", 0) or 0)
+    except Exception:
+        paragraph_no = 0
+
+    if any(k in text_value for k in ["blue", "prussian", "gainsborough", "egyptian blue", "pigment"]):
+        return "The History of Blue"
+    if any(k in text_value for k in ["native", "aboriginal", "bison", "plains", "horse", "nomadic"]):
+        return "The Changing Style of Native Americans"
+    if any(k in text_value for k in ["research", "archaeologist", "archaeologists", "excavation"]):
+        return "Research"
+    if any(k in text_value for k in ["physical anthropology", "genetic", "mendel", "blood groups", "heredity"]):
+        return "Modern Physical Anthropology"
+
+    # 旧DBで paragraph_no だけが分かる場合のフォールバック
+    if 1 <= paragraph_no <= 3:
+        return "Modern Physical Anthropology"
+    if 16 <= paragraph_no <= 21:
+        return "The Changing Style of Native Americans"
+    return title or "TOEFL-5600"
+
+
+def load_toefl_5600_passages():
+    """toefl_5600.db から TOEFL-5600 の本文データを読み込みます。
+
+    旧DB: paragraphs(id, paragraph_no, english_text, highlighted_html, red_phrases)
+    新DB: reading_passages(title, paragraph_no, english_text, highlighted_html, red_phrases)
+    の両方に対応します。
+    """
+    db_path = next((p for p in TOEFL_5600_DB_CANDIDATES if p.exists()), None)
+    if db_path is None:
+        return pd.DataFrame(), "DBが見つかりません: toefl_5600.db を app.py と同じフォルダに置いてください。"
+
+    try:
+        con = sqlite3.connect(db_path, check_same_thread=False)
+        cur = con.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = {row[0] for row in cur.fetchall()}
+
+        if "reading_passages" in tables:
+            table_name = "reading_passages"
+        elif "paragraphs" in tables:
+            table_name = "paragraphs"
+        else:
+            con.close()
+            return pd.DataFrame(), f"TOEFL-5600 DBに reading_passages / paragraphs テーブルがありません: {db_path.name}"
+
+        existing_cols = _toefl_table_columns(cur, table_name)
+        required = {"paragraph_no", "english_text", "highlighted_html", "red_phrases"}
+        missing = sorted(required - existing_cols)
+        if missing:
+            con.close()
+            return pd.DataFrame(), f"TOEFL-5600 DBの {table_name} テーブルに必要な列がありません: {', '.join(missing)}"
+
+        title_expr = "title" if "title" in existing_cols else "'TOEFL-5600' AS title"
+        id_expr = "id" if "id" in existing_cols else "rowid AS id"
+        red_phrases_jp_expr = "red_phrases_jp" if "red_phrases_jp" in existing_cols else "'' AS red_phrases_jp"
+        red_phrases_jp_json_expr = "red_phrases_jp_json" if "red_phrases_jp_json" in existing_cols else "'' AS red_phrases_jp_json"
+        df = pd.read_sql_query(
+            f"""
+            SELECT {id_expr}, {title_expr}, paragraph_no, english_text, highlighted_html, red_phrases,
+                   {red_phrases_jp_expr}, {red_phrases_jp_json_expr}
+            FROM {table_name}
+            ORDER BY title, paragraph_no, id
+            """,
+            con,
+        )
+        con.close()
+    except Exception as e:
+        return pd.DataFrame(), f"TOEFL-5600 DBの読み込みに失敗しました: {e}"
+
+    if df.empty:
+        return df, "TOEFL-5600 のデータがありません。"
+
+    for col in ["title", "english_text", "highlighted_html", "red_phrases", "red_phrases_jp", "red_phrases_jp_json"]:
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].fillna("").astype(str)
+    df["paragraph_no"] = pd.to_numeric(df["paragraph_no"], errors="coerce").fillna(0).astype(int)
+    df["title"] = df.apply(infer_toefl_title, axis=1)
+    df["red_phrase_list"] = df["red_phrases"].apply(parse_toefl_red_phrases)
+    df["red_phrase_jp_items"] = df.apply(parse_toefl_red_phrase_jp_items, axis=1)
+    df["source_db"] = str(db_path.name)
+    return df, ""
+
+
+def build_toefl_title_view(df):
+    """paragraph行をタイトル単位にまとめ、表示時は段落ごとに改行します。"""
+    grouped_rows = []
+    title_order = [
+        "Modern Physical Anthropology",
+        "Research",
+        "The Changing Style of Native Americans",
+        "The History of Blue",
+    ]
+    order_map = {title: i for i, title in enumerate(title_order)}
+
+    for title, g in df.sort_values(["title", "paragraph_no", "id"]).groupby("title", sort=False):
+        g = g.sort_values(["paragraph_no", "id"])
+        body_parts = []
+        plain_parts = []
+        phrase_list = []
+        phrase_jp_items = []
+        paragraph_numbers = []
+        for _, row in g.iterrows():
+            paragraph_numbers.append(int(row.get("paragraph_no", 0) or 0))
+            plain_text = str(row.get("english_text", "") or "").strip()
+            body_parts.append(plain_text)
+            plain_parts.append(plain_text)
+            for phrase in row.get("red_phrase_list", []) or []:
+                if phrase and phrase not in phrase_list:
+                    phrase_list.append(phrase)
+            seen_jp = {(x.get("en", "").lower(), x.get("ja", "")) for x in phrase_jp_items}
+            for item in row.get("red_phrase_jp_items", []) or []:
+                en = str(item.get("en", "") or "").strip()
+                ja = str(item.get("ja", "") or "").strip()
+                key = (en.lower(), ja)
+                if (en or ja) and key not in seen_jp:
+                    phrase_jp_items.append({"en": en, "ja": ja})
+                    seen_jp.add(key)
+
+        grouped_rows.append({
+            "title": str(title),
+            "sort_order": order_map.get(str(title), 999),
+            "paragraph_numbers": paragraph_numbers,
+            "paragraph_count": len(g),
+            "english_text": "\n\n".join(x for x in plain_parts if x),
+            "paragraph_texts": body_parts,
+            "highlighted_html": "\n".join(f'<p class="toefl5600-paragraph">{html.escape(x)}</p>' for x in body_parts if x),
+            "red_phrase_list": phrase_list,
+            "red_phrase_jp_items": phrase_jp_items,
+            "red_phrases": " | ".join(phrase_list),
+        })
+
+    out = pd.DataFrame(grouped_rows)
+    if not out.empty:
+        out = out.sort_values(["sort_order", "title"]).drop(columns=["sort_order"], errors="ignore")
+    return out
+
+def toefl_5600_page():
+    st.subheader("📕 TOEFL-5600")
+    st.caption("toefl_5600.db の本文を、タイトルごとに1つの文章として表示します。赤色ハイライトは赤色、英検1級・準1級の単語は緑色で表示します。日本語説明は『試験問題』の『答えと解説を表示』と同じように切り替えできます。")
+
+    df, err = load_toefl_5600_passages()
+    if err:
+        st.warning(err)
+    if df.empty:
         return
 
-    progress_df = progress_df.copy()
-    progress_df["score_rate"] = pd.to_numeric(progress_df["score_rate"], errors="coerce").fillna(0)
-    progress_df["total_count"] = pd.to_numeric(progress_df["total_count"], errors="coerce").fillna(0).astype(int)
-    progress_df["completed_count"] = pd.to_numeric(progress_df["completed_count"], errors="coerce").fillna(0).astype(int)
+    title_df = build_toefl_title_view(df)
+    if title_df.empty:
+        st.info("表示できるTOEFL-5600データがありません。")
+        return
 
-    total_items = int(progress_df["total_count"].sum())
-    completed_items = int(progress_df["completed_count"].sum())
-    overall_rate = percent_value(completed_items, total_items)
-    latest_updated = str(progress_df["updated_at"].max()) if "updated_at" in progress_df.columns else ""
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("全体進捗", f"{overall_rate:.1f}%")
-    c2.metric("記録項目", len(progress_df))
-    c3.metric("完了/正解", completed_items)
-    c4.metric("最終学習", latest_updated[:10])
-
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown("### 学習中の場所")
-    latest = progress_df.sort_values("updated_at", ascending=False).head(6)
-    for _, row in latest.iterrows():
-        rate = float(row.get("score_rate") or 0)
-        st.progress(min(1.0, max(0.0, rate / 100)))
-        st.write(
-            f"**{row.get('title','')}**  —  {int(row.get('completed_count') or 0)} / {int(row.get('total_count') or 0)} "
-            f"（{rate:.1f}%） / {row.get('status','')} / 更新: {row.get('updated_at','')}"
-        )
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown("### 分野別の進捗")
-    area_summary = progress_df.groupby("area", as_index=False).agg(
-        total_count=("total_count", "sum"),
-        completed_count=("completed_count", "sum"),
-        records=("item_key", "count"),
+    st.markdown(
+        """
+        <style>
+        .toefl5600-card {
+            padding: 18px 20px;
+            border-radius: 20px;
+            background: rgba(255,255,255,.045);
+            border: 1px solid rgba(255,255,255,.18);
+            margin: 0 0 14px 0;
+        }
+        .toefl5600-meta {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 999px;
+            background: rgba(255,255,255,.13);
+            color: #dce8fb;
+            font-size: 12px;
+            font-weight: 850;
+            margin-right: 6px;
+            margin-bottom: 10px;
+        }
+        .toefl5600-title {
+            color: #ffffff;
+            font-size: 24px;
+            font-weight: 900;
+            margin: 4px 0 10px 0;
+        }
+        .toefl5600-scroll {
+            max-height: 520px;
+            overflow-y: auto;
+            padding: 16px 18px;
+            border-radius: 16px;
+            background: rgba(0,0,0,.16);
+            border: 1px solid rgba(255,255,255,.12);
+        }
+        .toefl5600-text {
+            color: #ffffff;
+            font-size: 21px;
+            line-height: 1.9;
+            font-weight: 650;
+            overflow-wrap: anywhere;
+        }
+        .toefl5600-paragraph {
+            margin: 0 0 20px 0;
+        }
+        .toefl5600-paragraph:last-child {
+            margin-bottom: 0;
+        }
+        .toefl5600-text mark,
+        .toefl5600-text span[style*="color:red"],
+        .toefl5600-text span[style*="color: red"],
+        .toefl5600-text font[color="red"],
+        .toefl5600-red-hit {
+            color: #ff4d4d !important;
+            background: rgba(255, 77, 77, .14) !important;
+            border-radius: 5px;
+            padding: 0 3px;
+            font-weight: 900;
+        }
+        .toefl5600-eiken-hit {
+            color: #32d583 !important;
+            background: rgba(50, 213, 131, .12) !important;
+            border-radius: 5px;
+            padding: 0 3px;
+            font-weight: 900;
+            text-decoration: underline;
+            text-decoration-thickness: 2px;
+            text-underline-offset: 3px;
+        }
+        .toefl5600-jp-explain {
+            margin-top: 12px;
+            padding: 12px 14px;
+            border-radius: 14px;
+            background: rgba(50,213,131,.07);
+            border: 1px solid rgba(50,213,131,.22);
+            color: #dfffea;
+            line-height: 1.75;
+        }
+        .toefl5600-jp-row {
+            padding: 5px 0;
+            border-bottom: 1px solid rgba(255,255,255,.08);
+        }
+        .toefl5600-jp-row:last-child { border-bottom: 0; }
+        .toefl5600-jp-en { color: #ffffff; font-weight: 900; }
+        .toefl5600-jp-ja { color: #dfffea; }
+        .toefl5600-phrases {
+            margin-top: 12px;
+            padding: 12px 14px;
+            border-radius: 14px;
+            background: rgba(255,77,77,.08);
+            border: 1px solid rgba(255,77,77,.22);
+            color: #ffdede;
+            line-height: 1.7;
+        }
+        .toefl5600-chip {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 999px;
+            background: rgba(255,77,77,.12);
+            border: 1px solid rgba(255,77,77,.22);
+            color: #ffdede;
+            font-size: 13px;
+            font-weight: 750;
+            margin: 4px 6px 4px 0;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
-    area_summary["進捗率%"] = area_summary.apply(lambda r: percent_value(r["completed_count"], r["total_count"]), axis=1).round(1)
-    st.dataframe(area_summary.rename(columns={"area": "分野", "total_count": "合計", "completed_count": "完了/正解", "records": "記録数"}), use_container_width=True, hide_index=True)
-    st.markdown('</div>', unsafe_allow_html=True)
 
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown("### 詳細")
-    detail = progress_df.rename(columns={
-        "area": "分野",
-        "title": "内容",
-        "unit": "教材/Unit",
-        "section_no": "Section/Type",
-        "total_count": "合計",
-        "completed_count": "完了/正解",
-        "score_rate": "進捗率%",
-        "status": "状態",
-        "updated_at": "更新日時",
-    })
-    show_cols = ["分野", "内容", "教材/Unit", "Section/Type", "合計", "完了/正解", "進捗率%", "状態", "更新日時"]
-    st.dataframe(detail[show_cols], use_container_width=True, hide_index=True)
+    titles = ["すべて"] + [x for x in title_df["title"].dropna().astype(str).tolist() if x.strip()]
+    c1, c2, c3, c4 = st.columns([1.7, 2.0, 1.1, 1.4])
+    with c1:
+        selected_title = st.selectbox("Title", titles, index=0, key="toefl5600_title_select")
+    with c2:
+        keyword = st.text_input("検索", placeholder="例: anthropology / Native peoples / blue", key="toefl5600_keyword")
+    with c3:
+        show_phrases = st.checkbox("赤色フレーズ", value=True, key="toefl5600_show_phrases")
+    with c4:
+        show_jp_explain = st.toggle("日本語説明を表示", value=False, key="toefl5600_show_jp_explain")
+
+    view = title_df.copy()
+    if selected_title != "すべて":
+        view = view[view["title"] == selected_title]
+    if keyword:
+        k = keyword.lower().strip()
+        view = view[
+            view["title"].astype(str).str.lower().str.contains(k, na=False)
+            | view["english_text"].astype(str).str.lower().str.contains(k, na=False)
+            | view["highlighted_html"].astype(str).str.lower().str.contains(k, na=False)
+            | view["red_phrases"].astype(str).str.lower().str.contains(k, na=False)
+        ]
+
+    if view.empty:
+        st.info("この条件で表示できるTOEFL-5600データがありません。")
+        return
+
+    export_df = view.drop(columns=["red_phrase_list", "red_phrase_jp_items", "paragraph_texts"], errors="ignore").copy()
+    export_df["paragraph_numbers"] = export_df["paragraph_numbers"].apply(lambda xs: ", ".join(map(str, xs)) if isinstance(xs, list) else str(xs))
     st.download_button(
-        "学習記録CSVをダウンロード",
-        detail[show_cols].to_csv(index=False).encode("utf-8-sig"),
-        file_name="study_records.csv",
+        "TOEFL-5600 CSVをダウンロード",
+        export_df.to_csv(index=False).encode("utf-8-sig"),
+        file_name="toefl_5600_passages_by_title.csv",
         mime="text/csv",
     )
-    st.markdown('</div>', unsafe_allow_html=True)
 
-    if not events_df.empty:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("### テスト履歴")
-        events_view = events_df.rename(columns={
-            "area": "分野",
-            "event_type": "種類",
-            "title": "内容",
-            "total_count": "問題数",
-            "completed_count": "正解数",
-            "score_rate": "正解率%",
-            "created_at": "日時",
-        })
-        st.dataframe(events_view, use_container_width=True, hide_index=True)
+    c_total, c_title, c_para = st.columns(3)
+    c_total.metric("表示タイトル数", len(view))
+    c_title.metric("全タイトル数", title_df["title"].nunique())
+    c_para.metric("元Paragraph数", int(view["paragraph_count"].sum()))
+
+    passitan_index = build_passitan_word_index()
+    if passitan_index:
+        st.caption("緑色の単語は、英検1級・準1級のパス単DBに存在する単語です。赤色フレーズを優先して表示します。")
+
+    for _, row in view.iterrows():
+        title = str(row.get("title", "TOEFL-5600")) or "TOEFL-5600"
+        paragraph_numbers = row.get("paragraph_numbers", []) or []
+        paragraph_label = ", ".join(map(str, paragraph_numbers)) if isinstance(paragraph_numbers, list) else str(paragraph_numbers)
+        phrases = row.get("red_phrase_list", []) or []
+        phrase_jp_items = row.get("red_phrase_jp_items", []) or []
+        paragraph_texts = row.get("paragraph_texts", []) or []
+        if not isinstance(paragraph_texts, list) or not paragraph_texts:
+            paragraph_texts = [str(row.get("english_text", "") or "")]
+        body_html = "\n".join(
+            f'<p class="toefl5600-paragraph">{render_toefl_text_with_highlights(p, phrases, passitan_index)}</p>'
+            for p in paragraph_texts
+            if str(p or "").strip()
+        )
+
+        st.markdown('<div class="toefl5600-card">', unsafe_allow_html=True)
+        st.markdown(
+            f'<span class="toefl5600-meta">TOEFL-5600</span>'
+            f'<span class="toefl5600-meta">{html.escape(title)}</span>'
+            f'<span class="toefl5600-meta">Paragraph {html.escape(paragraph_label)}</span>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(f'<div class="toefl5600-title">{html.escape(title)}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="toefl5600-scroll"><div class="toefl5600-text">{body_html}</div></div>', unsafe_allow_html=True)
+        if show_phrases and phrases:
+            chips = "".join(f'<span class="toefl5600-chip">{html.escape(x)}</span>' for x in phrases)
+            st.markdown(f'<div class="toefl5600-phrases"><b>赤色フレーズ:</b><br>{chips}</div>', unsafe_allow_html=True)
+
+        if show_jp_explain and phrase_jp_items:
+            rows_html = []
+            for item in phrase_jp_items:
+                en = str(item.get("en", "") or "").strip()
+                ja = str(item.get("ja", "") or "").strip()
+                if en or ja:
+                    rows_html.append(
+                        '<div class="toefl5600-jp-row">'
+                        f'<span class="toefl5600-jp-en">{html.escape(en)}</span>'
+                        f'：<span class="toefl5600-jp-ja">{html.escape(ja)}</span>'
+                        '</div>'
+                    )
+            if rows_html:
+                st.markdown(
+                    '<div class="toefl5600-jp-explain"><b>日本語説明:</b>' + ''.join(rows_html) + '</div>',
+                    unsafe_allow_html=True,
+                )
         st.markdown('</div>', unsafe_allow_html=True)
 
+
+
+
+def load_scientificamerican_articles():
+    """scientificamerican系DBから記事本文・日本語訳・画像を読み込みます。
+
+    新DB: science_articles_bilingual.db / articles(id, title, subtitle, content, image, content_ja)
+    旧DB: scientificamerican.db / articles(id, title, subtitle, content, image)
+    の両方に対応します。
+    """
+    db_path = next((p for p in SCIENTIFICAMERICAN_DB_CANDIDATES if p.exists()), None)
+    if db_path is None:
+        return pd.DataFrame(), "DBが見つかりません: science_articles_bilingual.db または scientificamerican.db を app.py と同じフォルダに置いてください。"
+
+    try:
+        con = sqlite3.connect(db_path, check_same_thread=False)
+        cur = con.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='articles'")
+        if cur.fetchone() is None:
+            con.close()
+            return pd.DataFrame(), f"scientificamerican DBに articles テーブルがありません: {db_path.name}"
+
+        cur.execute("PRAGMA table_info(articles)")
+        existing_cols = {row[1] for row in cur.fetchall()}
+        required = {"title", "content"}
+        missing = sorted(required - existing_cols)
+        if missing:
+            con.close()
+            return pd.DataFrame(), f"scientificamerican DBの articles テーブルに必要な列がありません: {', '.join(missing)}"
+
+        id_expr = "id" if "id" in existing_cols else "rowid AS id"
+        subtitle_expr = "subtitle" if "subtitle" in existing_cols else "'' AS subtitle"
+        image_expr = "image" if "image" in existing_cols else "NULL AS image"
+        content_ja_expr = "content_ja" if "content_ja" in existing_cols else "'' AS content_ja"
+        df = pd.read_sql_query(
+            f"""
+            SELECT {id_expr}, title, {subtitle_expr}, content, {content_ja_expr}, {image_expr}
+            FROM articles
+            ORDER BY id
+            """,
+            con,
+        )
+        con.close()
+    except Exception as e:
+        return pd.DataFrame(), f"scientificamerican DBの読み込みに失敗しました: {e}"
+
+    if df.empty:
+        return df, "scientificamerican.com の記事データがありません。"
+
+    for col in ["title", "subtitle", "content", "content_ja"]:
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].fillna("").astype(str)
+    df["source_db"] = str(db_path.name)
+    return df, ""
+
+
+def scientificamerican_image_data_uri(image_value, max_width=760):
+    """DBの画像BLOBを、本文と並べやすいサイズに圧縮して data URI に変換します。"""
+    import base64
+    import io
+
+    if image_value is None:
+        return ""
+    try:
+        blob = bytes(image_value)
+    except Exception:
+        return ""
+    if not blob:
+        return ""
+
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(blob))
+        img = img.convert("RGB")
+        if img.width > max_width:
+            ratio = max_width / float(img.width)
+            new_size = (int(img.width * ratio), int(img.height * ratio))
+            img = img.resize(new_size)
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=82, optimize=True)
+        blob = out.getvalue()
+        mime = "image/jpeg"
+    except Exception:
+        if blob[:8] == b"\x89PNG\r\n\x1a\n":
+            mime = "image/png"
+        else:
+            mime = "image/jpeg"
+
+    return f"data:{mime};base64," + base64.b64encode(blob).decode("ascii")
+
+
+def render_scientificamerican_text(text, keyword="", passitan_index=None):
+    """記事本文を段落HTMLへ変換。検索語とパス単語リンクを同時に強調します。"""
+    import re
+
+    text = str(text or "").strip()
+    if not text:
+        return ""
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    passitan_index = passitan_index or {}
+    passitan_pattern = _passitan_match_pattern(passitan_index) if passitan_index else None
+    keyword_text = str(keyword or "").strip()
+    keyword_pattern = re.compile(re.escape(keyword_text), re.IGNORECASE) if keyword_text else None
+
+    def render_segment(segment):
+        # まずパス単語をリンク化します。リンク化した範囲では検索語ハイライトは重ねません。
+        if not segment:
+            return ""
+        if passitan_pattern is None:
+            return render_keyword_only(segment)
+        out = []
+        pos = 0
+        for m in passitan_pattern.finditer(segment):
+            out.append(render_keyword_only(segment[pos:m.start()]))
+            matched = m.group(0)
+            info = passitan_index.get(matched.lower())
+            if info:
+                from urllib.parse import urlencode
+                title = f"{info.get('grade', 'パス単') or 'パス単'} No.{info.get('no', '')} / {info.get('meaning', '')}"
+                query = urlencode({
+                    "goto_passitan_word": str(info.get("word", matched) or matched),
+                    "goto_passitan_grade": str(info.get("grade", "") or ""),
+                    "goto_passitan_no": str(info.get("no", "") or ""),
+                })
+                out.append(
+                    f'<a class="sciam-eiken-hit" href="?{html.escape(query)}" target="_self" '
+                    f'title="{html.escape(title)}">{html.escape(matched)}</a>'
+                )
+            else:
+                out.append(html.escape(matched))
+            pos = m.end()
+        out.append(render_keyword_only(segment[pos:]))
+        return "".join(out)
+
+    def render_keyword_only(segment):
+        if not segment:
+            return ""
+        if keyword_pattern is None:
+            return html.escape(segment)
+        out = []
+        pos = 0
+        for m in keyword_pattern.finditer(segment):
+            out.append(html.escape(segment[pos:m.start()]))
+            out.append(f'<mark class="sciam-keyword-hit">{html.escape(m.group(0))}</mark>')
+            pos = m.end()
+        out.append(html.escape(segment[pos:]))
+        return "".join(out)
+
+    return "".join(f'<p class="sciam-paragraph">{render_segment(p)}</p>' for p in paragraphs)
+
+
+def scientificamerican_page():
+    st.subheader("🔬 scientificamerican.com")
+    st.caption("science_articles_bilingual.db の articles テーブルから、英文・日本語翻訳・画像を表示します。日本語翻訳は TOEFL-5600 と同じように切り替えできます。")
+
+    df, err = load_scientificamerican_articles()
+    if err:
+        st.warning(err)
+    if df.empty:
+        return
+
+    st.markdown(
+        """
+        <style>
+        .sciam-card {
+            padding: 18px 20px;
+            border-radius: 20px;
+            background: rgba(255,255,255,.045);
+            border: 1px solid rgba(255,255,255,.18);
+            margin: 0 0 16px 0;
+        }
+        .sciam-meta {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 999px;
+            background: rgba(255,255,255,.13);
+            color: #dce8fb;
+            font-size: 12px;
+            font-weight: 850;
+            margin-right: 6px;
+            margin-bottom: 10px;
+        }
+        .sciam-title {
+            color: #ffffff;
+            font-size: 30px;
+            line-height: 1.25;
+            font-weight: 900;
+            margin: 4px 0 8px 0;
+        }
+        .sciam-subtitle {
+            color: #b7ffcf;
+            font-size: 18px;
+            line-height: 1.55;
+            font-weight: 750;
+            margin: 0 0 14px 0;
+        }
+        .sciam-scroll {
+            max-height: 620px;
+            overflow-y: auto;
+            padding: 18px 20px;
+            border-radius: 16px;
+            background: rgba(0,0,0,.16);
+            border: 1px solid rgba(255,255,255,.12);
+        }
+        .sciam-text {
+            color: #ffffff;
+            font-size: 20px;
+            line-height: 1.9;
+            font-weight: 650;
+            overflow-wrap: anywhere;
+        }
+        .sciam-inline-image {
+            float: right;
+            width: min(42%, 390px);
+            max-height: 360px;
+            object-fit: contain;
+            border-radius: 16px;
+            border: 1px solid rgba(255,255,255,.16);
+            background: rgba(0,0,0,.24);
+            margin: 2px 0 14px 22px;
+            box-shadow: 0 18px 45px rgba(0,0,0,.28);
+        }
+        .sciam-paragraph { margin: 0 0 20px 0; }
+        .sciam-paragraph:last-child { margin-bottom: 0; }
+        .sciam-keyword-hit {
+            color: #111827 !important;
+            background: #ffe066 !important;
+            border-radius: 5px;
+            padding: 0 3px;
+            font-weight: 900;
+        }
+        .sciam-eiken-hit {
+            color: #32d583 !important;
+            background: rgba(50, 213, 131, .12) !important;
+            border-radius: 5px;
+            padding: 0 3px;
+            font-weight: 900;
+            text-decoration: underline;
+            text-decoration-thickness: 2px;
+            text-underline-offset: 3px;
+            cursor: pointer;
+        }
+        .sciam-jp-box {
+            margin-top: 14px;
+            padding: 14px 16px;
+            border-radius: 14px;
+            background: rgba(50,213,131,.07);
+            border: 1px solid rgba(50,213,131,.22);
+            color: #dfffea;
+            line-height: 1.85;
+            font-size: 18px;
+            overflow-wrap: anywhere;
+        }
+        .sciam-jp-title {
+            color: #ffffff;
+            font-weight: 900;
+            margin-bottom: 8px;
+        }
+        .sciam-clear { clear: both; height: 1px; }
+        @media (max-width: 768px) {
+            .sciam-title { font-size: 24px; }
+            .sciam-text { font-size: 18px; }
+            .sciam-inline-image {
+                float: none;
+                width: 100%;
+                max-height: 320px;
+                margin: 0 0 14px 0;
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    title_options = ["すべて"] + [str(x) for x in df["title"].dropna().astype(str).tolist() if str(x).strip()]
+    c1, c2, c3, c4 = st.columns([2.0, 2.0, 1.2, 1.5])
+    with c1:
+        selected_title = st.selectbox("Article", title_options, index=0, key="sciam_title_select")
+    with c2:
+        keyword = st.text_input("検索", placeholder="例: ants / moon / compass", key="sciam_keyword")
+    with c3:
+        show_image = st.checkbox("画像を表示", value=True, key="sciam_show_image")
+    with c4:
+        show_japanese = st.toggle("日本語の翻訳を表示", value=False, key="sciam_show_japanese")
+
+    view = df.copy()
+    if selected_title != "すべて":
+        view = view[view["title"] == selected_title]
+    if keyword:
+        k = keyword.lower().strip()
+        view = view[
+            view["title"].astype(str).str.lower().str.contains(k, na=False)
+            | view["subtitle"].astype(str).str.lower().str.contains(k, na=False)
+            | view["content"].astype(str).str.lower().str.contains(k, na=False)
+            | view["content_ja"].astype(str).str.lower().str.contains(k, na=False)
+        ]
+
+    if view.empty:
+        st.info("この条件で表示できる scientificamerican.com の記事がありません。")
+        return
+
+    export = view.drop(columns=["image"], errors="ignore").copy()
+    st.download_button(
+        "scientificamerican.com CSVをダウンロード",
+        export.to_csv(index=False).encode("utf-8-sig"),
+        file_name="scientificamerican_articles_bilingual.csv",
+        mime="text/csv",
+    )
+
+    c_total, c_show, c_db = st.columns(3)
+    c_total.metric("全記事数", len(df))
+    c_show.metric("表示記事数", len(view))
+    c_db.metric("DB", str(view["source_db"].iloc[0]) if "source_db" in view.columns and not view.empty else "-")
+
+    passitan_index = build_passitan_word_index()
+    if passitan_index:
+        st.caption("緑色の単語は、英検準1級・英検1級のパス単DBに存在する単語です。クリックするとパス単画面へ移動します。")
+
+    for _, row in view.iterrows():
+        article_id = int(row.get("id", 0) or 0)
+        title = str(row.get("title", "") or "Untitled")
+        subtitle = str(row.get("subtitle", "") or "")
+        content = str(row.get("content", "") or "")
+        content_ja = str(row.get("content_ja", "") or "")
+        image_uri = scientificamerican_image_data_uri(row.get("image")) if show_image else ""
+        body_html = render_scientificamerican_text(content, keyword=keyword, passitan_index=passitan_index)
+        image_html = f'<img class="sciam-inline-image" src="{image_uri}" alt="{html.escape(title)}">' if image_uri else ""
+        jp_html = render_scientificamerican_text(content_ja, keyword=keyword, passitan_index={}) if content_ja else ""
+
+        st.markdown('<div class="sciam-card">', unsafe_allow_html=True)
+        st.markdown(
+            f'<span class="sciam-meta">scientificamerican.com</span>'
+            f'<span class="sciam-meta">Article ID {article_id}</span>'
+            f'<span class="sciam-meta">{html.escape(str(row.get("source_db", "")))}</span>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(f'<div class="sciam-title">{html.escape(title)}</div>', unsafe_allow_html=True)
+        if subtitle:
+            st.markdown(f'<div class="sciam-subtitle">{html.escape(subtitle)}</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="sciam-scroll"><div class="sciam-text">{image_html}{body_html}<div class="sciam-clear"></div></div></div>',
+            unsafe_allow_html=True,
+        )
+        if show_japanese:
+            if jp_html:
+                st.markdown(
+                    f'<div class="sciam-jp-box"><div class="sciam-jp-title">日本語の翻訳</div>{jp_html}</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.info("このArticleには日本語翻訳 content_ja がありません。")
+        st.markdown('</div>', unsafe_allow_html=True)
 
 def data_page(df):
     st.subheader("🛠 データ管理")
@@ -3471,24 +4933,30 @@ def main():
         auth_page()
         return
 
+    apply_passitan_jump_from_query()
     df = load_questions()
-    page, selected, keyword, question_submenu = sidebar_filters(df)
-    save_user_progress("app", {"last_page": page})
+    page, selected, keyword, question_submenu, question_grade = sidebar_filters(df)
     fdf = apply_filter(df, selected, keyword)
     if page == "🏠 Overview":
         overview(fdf)
     elif page == "📚 試験問題":
-        list_page(fdf, submenu=question_submenu or "Vocabulary")
+        list_page(fdf, submenu=question_submenu or "Vocabulary", selected_grade=question_grade or "英検準1級")
     elif page == "🧠 Quiz":
         quiz_page(fdf)
     elif page == "📗 パス単":
         passitan_page()
     elif page == "🧪 パス単テスト":
         passitan_test_page()
+    elif page == "🧩 単語整理":
+        vocab_strategy_page()
+    elif page == "📕 TOEFL-5600":
+        toefl_5600_page()
+    elif page == "📙 TOEFL-KMF-word":
+        toefl_kmf_word_page()
+    elif page == "🔬 scientificamerican.com":
+        scientificamerican_page()
     elif page == "🌟 special-lesson":
         special_lesson_page()
-    elif page == "📈 学習記録":
-        study_records_page()
     elif page == "📝 単語帳":
         vocab_page()
     elif page == "📄 PDF生成":
